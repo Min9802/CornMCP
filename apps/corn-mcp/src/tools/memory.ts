@@ -14,12 +14,18 @@ async function createEmbedder(): Promise<EmbeddingProvider> {
   const model = process.env['MEM9_EMBEDDING_MODEL'] || 'voyage-code-3'
   const dims = Number(process.env['MEM9_EMBEDDING_DIMS']) || 1024
 
+  // Model rotation: comma-separated fallback list from env, or sensible defaults
+  const fallbackEnv = process.env['MEM9_FALLBACK_MODELS'] || ''
+  const fallbackModels = fallbackEnv
+    ? fallbackEnv.split(',').map((m) => m.trim()).filter(Boolean)
+    : ['voyage-code-2', 'voyage-4', 'voyage-4-lite', 'voyage-4-large']
+
   if (apiKey) {
     // Test the key before committing to it
     try {
-      const testEmbedder = new OpenAIEmbeddingProvider(apiKey, apiBase, model, dims)
+      const testEmbedder = new OpenAIEmbeddingProvider(apiKey, apiBase, model, dims, fallbackModels)
       await testEmbedder.embed(['test'])
-      console.error('[corn-mcp] Embedding API key validated ✓')
+      console.error(`[corn-mcp] Embedding API key validated ✓ (primary: ${model}, fallbacks: ${fallbackModels.join(', ')})`)
       return testEmbedder
     } catch (err) {
       console.error(`[corn-mcp] Embedding API key invalid, falling back to local hash embeddings: ${err instanceof Error ? err.message : err}`)
