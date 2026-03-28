@@ -36,13 +36,18 @@ export function createLogger(service: string): Logger {
 // ─── Error Classes ──────────────────────────────────────
 
 export class CornError extends Error {
+  public code: string
+  public statusCode: number
+
   constructor(
     message: string,
-    public code: string,
-    public statusCode: number = 500,
+    code: string,
+    statusCode: number = 500,
   ) {
     super(message)
     this.name = 'CornError'
+    this.code = code
+    this.statusCode = statusCode
   }
 }
 
