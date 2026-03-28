@@ -1,4 +1,4 @@
-# 🌽 Corn Hub
+# 🌽 CornMCP
 
 **The AI Agent Intelligence Platform — MCP Server + Analytics Dashboard**
 
@@ -12,18 +12,20 @@
 
 ---
 
-## What is Corn Hub?
+## What is CornMCP?
 
-Corn Hub is a **Model Context Protocol (MCP) server** and real-time **analytics dashboard** that gives AI coding agents (Antigravity, Cursor, Claude Code, Codex) surgical access to your codebase through 18 specialized tools.
+CornMCP is a **Model Context Protocol (MCP) server** and real-time **analytics dashboard** that gives AI coding agents (Antigravity, Cursor, Claude Code, Codex) surgical access to your codebase through 18 specialized tools.
 
-Instead of dumping entire files into the context window, Corn Hub provides:
+Instead of dumping entire files into the context window, CornMCP provides:
 
+- 🔐 **Authentication & Multi-User** — Login/Register, JWT sessions, API key auth, role-based access (admin/user)
 - 🧠 **Semantic Memory** — Agents remember across sessions via vector search
 - 🔍 **Native AST Engine** — Real call graphs, type hierarchies, and symbol-level analysis via TypeScript Compiler API
 - 📋 **Quality Gates** — Plans must score ≥80% before execution
 - 📊 **Live Analytics** — Track every tool call, latency, and token savings
 - 🔄 **Multi-Agent Awareness** — Agents see each other's changes in real-time
-- 💾 **Zero External Dependencies** — No Docker, no external services. Everything runs locally with SQLite.
+- 🔒 **Data Isolation** — API keys, providers, organizations, and knowledge scoped per user
+- 💾 **Qdrant Vector DB** — High-performance vector search for memory and knowledge
 
 ---
 
@@ -382,29 +384,35 @@ corn-hub/
 │   │       ├── index.ts       # Server entry, health checks
 │   │       ├── db/
 │   │       │   ├── client.ts  # SQLite client (sql.js)
-│   │       │   └── schema.sql # Database schema (code_symbols, code_edges, etc.)
+│   │       │   └── schema.sql # Database schema
+│   │       ├── middleware/
+│   │       │   └── auth.ts    # JWT + API key auth middleware
 │   │       ├── services/
-│   │       │   └── ast-engine.ts  # 🆕 Native TypeScript Compiler API AST engine
+│   │       │   └── ast-engine.ts  # Native TypeScript Compiler API AST engine
 │   │       └── routes/
-│   │           ├── intel.ts      # Code intelligence (search, context, impact, cypher)
-│   │           ├── indexing.ts   # Trigger AST analysis for projects
+│   │           ├── auth.ts       # Login, register, validate-key
+│   │           ├── users.ts      # User management (admin)
+│   │           ├── intel.ts      # Code intelligence
+│   │           ├── indexing.ts   # AST analysis trigger
 │   │           ├── analytics.ts  # Tool usage analytics
+│   │           ├── keys.ts       # API key management
 │   │           ├── knowledge.ts  # Knowledge base CRUD
 │   │           ├── projects.ts   # Project management
 │   │           ├── providers.ts  # LLM provider accounts
 │   │           ├── quality.ts    # 4D quality reports
 │   │           ├── sessions.ts   # Agent session tracking
-│   │           ├── setup.ts      # System info
 │   │           ├── stats.ts      # Dashboard metrics
-│   │           ├── system.ts     # System metrics (CPU, memory)
+│   │           ├── system.ts     # System metrics
 │   │           ├── usage.ts      # Token usage tracking
 │   │           └── webhooks.ts   # Webhook endpoints
 │   │
 │   ├── corn-mcp/              # MCP Server (18 tools)
 │   │   └── src/
-│   │       ├── cli.ts         # STDIO transport + telemetry interceptor
-│   │       ├── index.ts       # Server factory + tool registration
+│   │       ├── cli.ts         # STDIO transport + telemetry
+│   │       ├── index.ts       # Server factory + tool registration + OAuth
 │   │       ├── node.ts        # HTTP transport entry point
+│   │       ├── middleware/
+│   │       │   └── auth.ts    # API key validation via corn-api DB
 │   │       └── tools/
 │   │           ├── analytics.ts   # corn_tool_stats
 │   │           ├── changes.ts     # corn_changes, corn_detect_changes
@@ -413,41 +421,44 @@ corn-hub/
 │   │           ├── knowledge.ts   # corn_knowledge_search/store
 │   │           ├── memory.ts      # corn_memory_search/store
 │   │           ├── quality.ts     # corn_plan_quality, corn_quality_report
-│   │           └── sessions.ts    # corn_session_start/end
+│   │           └── session.ts     # corn_session_start/end
 │   │
 │   └── corn-web/              # Analytics Dashboard (Next.js 16)
 │       └── src/
 │           ├── app/
 │           │   ├── page.tsx       # Main dashboard
+│           │   ├── login/         # Login page
+│           │   ├── register/      # Registration page
+│           │   ├── users/         # User management (admin)
+│           │   ├── keys/          # API key management
+│           │   ├── orgs/          # Organization CRUD
 │           │   ├── quality/       # Quality reports & grade trends
 │           │   ├── sessions/      # Agent session history
 │           │   ├── usage/         # Token usage analytics
 │           │   ├── knowledge/     # Knowledge base viewer
 │           │   ├── projects/      # Project management
-│           │   ├── installation/  # IDE setup guide
+│           │   ├── providers/     # LLM provider accounts
+│           │   ├── setup/         # IDE setup guide
 │           │   └── settings/      # Configuration
 │           ├── components/
 │           │   └── layout/        # Glassmorphic dashboard shell
 │           └── lib/
-│               └── api.ts         # API client
+│               ├── api.ts         # API client
+│               └── auth.ts        # Auth client (login/register/logout)
 │
 ├── packages/
 │   ├── shared-mem9/           # Vector DB + Embedding Provider
-│   │   └── src/index.ts       # SQLite vector store, model rotation,
-│   │                          # OpenAI/Voyage embeddings, hash fallback
 │   ├── shared-types/          # Shared TypeScript interfaces
 │   └── shared-utils/          # Logger, ID gen, error classes
 │
 ├── infra/
-│   ├── docker-compose.yml     # Optional Docker stack
+│   ├── docker-compose.yml     # Docker stack (Qdrant, API, MCP, Web)
 │   ├── Dockerfile.corn-api
 │   ├── Dockerfile.corn-mcp
 │   ├── Dockerfile.corn-web
-│   └── nginx-dashboard.conf
+│   └── .env.example
 │
-└── .agent/
-    └── workflows/
-        └── corn-quality-gates.md  # Mandatory AI quality workflow
+└── CHANGELOG.md
 ```
 
 ---
@@ -592,8 +603,8 @@ Configure in `.agent/workflows/corn-quality-gates.md`.
 
 ```bash
 # Clone
-git clone https://github.com/yuki-20/corn-hub.git
-cd corn-hub
+git clone https://github.com/Min9802/CornMCP.git
+cd CornMCP
 
 # Install dependencies
 pnpm install
@@ -608,47 +619,68 @@ cd apps/corn-mcp && npx tsx src/node.ts
 cd apps/corn-web && npx next dev
 ```
 
-| Service | Port | Description |
+| Service | Port (default) | Description |
 |---------|------|-------------|
-| **corn-api** | `:4000` | Hono REST API + SQLite + AST Engine |
+| **corn-api** | `:6100` (host) → `:4000` (container) | Hono REST API + SQLite + AST Engine |
 | **corn-mcp** | `:8317` | MCP Gateway (HTTP transport) |
 | **corn-web** | `:3000` | Next.js Dashboard |
 
+> Host ports are configurable via `API_PORT`, `MCP_PORT`, `WEB_PORT` in `infra/.env`.
+
 ### IDE Configuration
 
-> ⚠️ **Replace the path below** with where YOU cloned corn-hub.
+> ⚠️ **Replace the path/URL below** with your actual setup.
 
-#### Antigravity / Codex (VS Code)
+#### STDIO Mode (Local)
 
 ```json
 {
   "mcpServers": {
     "corn": {
       "command": "node",
-      "args": ["/path/to/corn-hub/apps/corn-mcp/dist/cli.js"]
+      "args": ["/path/to/CornMCP/apps/corn-mcp/dist/cli.js"]
     }
   }
 }
 ```
+
+#### HTTP Mode (Remote / Docker)
+
+```json
+{
+  "mcpServers": {
+    "corn-hub": {
+      "url": "https://your-domain.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-api-key>"
+      }
+    }
+  }
+}
+```
+
+> **Nginx note**: When proxying `/mcp/` to the MCP container, use trailing slashes on both `location /mcp/` and `proxy_pass http://127.0.0.1:8317/` to strip the prefix correctly.
+
+> Generate your API key in the Dashboard → **Keys** page after logging in.
 
 #### Cursor
 
 1. **Settings** → **Features** → **MCP**
 2. Click **+ Add new MCP server**
 3. **Name**: `corn` · **Type**: `command`
-4. **Command**: `node /path/to/corn-hub/apps/corn-mcp/dist/cli.js`
+4. **Command**: `node /path/to/CornMCP/apps/corn-mcp/dist/cli.js`
 
 #### Claude Code
 
 ```bash
-claude mcp add corn -- node /path/to/corn-hub/apps/corn-mcp/dist/cli.js
+claude mcp add corn -- node /path/to/CornMCP/apps/corn-mcp/dist/cli.js
 ```
 
 | OS | Example Path |
 |---------|-----------------------------------------------------|
-| Windows | `C:\Users\You\corn-hub\apps\corn-mcp\dist\cli.js` |
-| macOS | `/Users/You/corn-hub/apps/corn-mcp/dist/cli.js` |
-| Linux | `/home/You/corn-hub/apps/corn-mcp/dist/cli.js` |
+| Windows | `C:\Users\You\CornMCP\apps\corn-mcp\dist\cli.js` |
+| macOS | `/Users/You/CornMCP/apps/corn-mcp/dist/cli.js` |
+| Linux | `/home/You/CornMCP/apps/corn-mcp/dist/cli.js` |
 
 ### Indexing Your Project
 
@@ -674,9 +706,40 @@ curl -X POST http://localhost:4000/api/intel/analyze \
 docker compose -f infra/docker-compose.yml up -d --build
 ```
 
-Open **http://localhost:3000** → the Corn Hub Analytics Dashboard.
+Open **http://localhost:3000** → the CornMCP Analytics Dashboard.
 
 > **Note:** Docker is optional. All services run natively with Node.js for development.
+
+---
+
+## Authentication
+
+CornMCP includes a built-in authentication system:
+
+### User Registration
+- **First user** registered automatically becomes **admin**
+- All subsequent users get **user** role
+- Open registration — anyone can create an account
+
+### Auth Methods
+| Method | Used By | How |
+|--------|---------|-----|
+| **JWT Cookie** | Dashboard (browser) | Login via `/api/auth/login`, cookie `corn_token` |
+| **API Key** | MCP Server (agents) | `Authorization: Bearer <key>` or `X-API-Key: <key>` |
+
+### Data Isolation
+- API keys, providers, organizations, knowledge, and quality reports are **scoped per user**
+- Admin can see all data; regular users see only their own
+- MCP tools inherit the user context from the API key used
+
+### Key Endpoints
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/auth/register` | POST | Create new account |
+| `/api/auth/login` | POST | Login (sets JWT cookie) |
+| `/api/auth/logout` | POST | Logout (clears cookie) |
+| `/api/auth/me` | GET | Current user info |
+| `/api/auth/validate-key` | POST | Validate API key (used by MCP) |
 
 ---
 
@@ -684,12 +747,22 @@ Open **http://localhost:3000** → the Corn Hub Analytics Dashboard.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `AUTH_JWT_SECRET` | `changeme` | JWT secret for user authentication |
+| `CORS_ORIGIN` | `http://localhost:3000` | Allowed CORS origin for dashboard |
+| `DASHBOARD_API_KEY` | — | API key for MCP → API communication |
+| `DASHBOARD_API_URL` | `http://localhost:4000` | Dashboard API URL |
 | `OPENAI_API_KEY` | — | Voyage AI / OpenAI API key for embeddings |
 | `OPENAI_API_BASE` | `https://api.voyageai.com/v1` | Embedding API base URL |
 | `MEM9_EMBEDDING_MODEL` | `voyage-code-3` | Primary embedding model |
 | `MEM9_EMBEDDING_DIMS` | `1024` | Embedding dimensions |
 | `MEM9_FALLBACK_MODELS` | `voyage-4-large,voyage-4,voyage-code-2,voyage-4-lite` | Fallback model rotation chain |
-| `DASHBOARD_API_URL` | `http://localhost:4000` | Dashboard API URL |
+| `GEMINI_API_KEY` | — | Google Gemini API key (optional) |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:4000` | API URL used by the dashboard frontend |
+| `NEXT_PUBLIC_MCP_URL` | `http://localhost:8317` | MCP server URL used by the dashboard frontend |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant vector database URL |
+| `API_PORT` | `6100` | Host port mapped to corn-api container |
+| `MCP_PORT` | `8317` | Host port mapped to corn-mcp container |
+| `WEB_PORT` | `3000` | Host port mapped to corn-web container |
 
 ### Model Rotation
 
@@ -760,9 +833,10 @@ During a live 29-call session on the Corn Hub codebase (55 files, 217 KB):
 |-------|-----------|-----|
 | MCP Server | TypeScript + `@modelcontextprotocol/sdk` | Type-safe tool definitions |
 | API | Hono 4 | Ultra-fast, 0-dependency HTTP |
+| Auth | JWT (jose) + bcryptjs | Secure sessions & password hashing |
 | Database | sql.js (WASM SQLite) | In-memory + file persistence, no C++ deps |
 | AST Engine | TypeScript Compiler API | Real call graphs, not text grep |
-| Vectors | SQLite vector store | Cosine similarity search, no external DB |
+| Vectors | Qdrant | High-performance vector search |
 | Embeddings | Voyage AI (voyage-code-3) | Best-in-class code retrieval |
 | Dashboard | Next.js 16 (Turbopack) | Fast dev, modern React |
 | Monorepo | pnpm + Turborepo | Incremental builds |
@@ -771,15 +845,15 @@ During a live 29-call session on the Corn Hub codebase (55 files, 217 KB):
 
 ## Releases
 
-See the [GitHub Releases](https://github.com/yuki-20/corn-hub/releases) page for version history and changelogs.
+See the [GitHub Releases](https://github.com/Min9802/CornMCP/releases) page and [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ---
 
 ## Contributors
 
-| <a href="https://github.com/yuki-20"><img src="https://github.com/yuki-20.png" width="80" style="border-radius:50%"><br>**yuki-20**</a> | <a href="https://github.com/AntiTamper"><img src="https://github.com/AntiTamper.png" width="80" style="border-radius:50%"><br>**AntiTamper**</a> |
-|:---:|:---:|
-| 🏆 Creator & Lead | 🤝 Co-Contributor |
+| <a href="https://github.com/yuki-20"><img src="https://github.com/yuki-20.png" width="80" style="border-radius:50%"><br>**yuki-20**</a> | <a href="https://github.com/AntiTamper"><img src="https://github.com/AntiTamper.png" width="80" style="border-radius:50%"><br>**AntiTamper**</a> | <a href="https://github.com/Min9802"><img src="https://github.com/Min9802.png" width="80" style="border-radius:50%"><br>**Min9802**</a> |
+|:---:|:---:|:---:|
+| 🏆 Creator & Lead | 🤝 Co-Contributor | ✨ Feature Contributor |
 
 ---
 
