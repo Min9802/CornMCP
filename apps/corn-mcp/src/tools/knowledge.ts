@@ -17,7 +17,7 @@ async function createEmbedder(): Promise<EmbeddingProvider> {
   const fallbackEnv = process.env['MEM9_FALLBACK_MODELS'] || ''
   const fallbackModels = fallbackEnv
     ? fallbackEnv.split(',').map((m) => m.trim()).filter(Boolean)
-    : ['voyage-code-2', 'voyage-4', 'voyage-4-lite', 'voyage-4-large']
+    : ['voyage-4-large', 'voyage-4', 'voyage-code-2', 'voyage-4-lite']
 
   if (apiKey) {
     try {
