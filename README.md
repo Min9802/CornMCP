@@ -29,50 +29,346 @@ Instead of dumping entire files into the context window, Corn Hub provides:
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     YOUR IDE                            │
-│  (Antigravity / Cursor / Claude Code / Codex)           │
-│                                                         │
-│  ┌──────────────────┐                                   │
-│  │   AI Agent        │──── STDIO Transport ────┐        │
-│  │   (LLM)           │                         │        │
-│  └──────────────────┘                         │        │
-└───────────────────────────────────────────────│────────┘
-                                                │
-                    ┌───────────────────────────▼────────┐
-                    │         corn-mcp (STDIO)           │
-                    │    18 MCP Tools + Telemetry         │
-                    │    Model Rotation (Voyage AI)       │
-                    └──────────┬────────────────────────┘
-                               │
-              ┌────────────────▼───────────────────────┐
-              │          corn-api :4000                  │
-              │    Hono REST API + SQLite (sql.js)       │
-              │                                         │
-              │  ┌─────────────────────────────────┐    │
-              │  │  Native AST Engine               │    │
-              │  │  TypeScript Compiler API          │    │
-              │  │  Call Graphs · Type Hierarchies   │    │
-              │  │  Import Maps · Symbol Extraction  │    │
-              │  │  965 symbols · 407 edges          │    │
-              │  └─────────────────────────────────┘    │
-              │                                         │
-              │  ┌─────────────────────────────────┐    │
-              │  │  SQLite Vector Store              │    │
-              │  │  Semantic Memory + Knowledge      │    │
-              │  │  Cosine Similarity Search         │    │
-              │  └─────────────────────────────────┘    │
-              └────────────────┬───────────────────────┘
-                               │
-                        ┌──────▼──────────────┐
-                        │  corn-web :3000      │
-                        │  Next.js 16 Dashboard│
-                        └─────────────────────┘
+### 1. System Overview
+
+> How the three services connect and communicate.
+
+```mermaid
+graph TB
+    subgraph IDE["🖥️ Your IDE"]
+        Agent["🤖 AI Agent<br/>(Antigravity / Cursor / Claude)"]
+    end
+
+    subgraph MCP["🌽 corn-mcp :8317"]
+        direction TB
+        Transport["Streamable HTTP Transport<br/>/mcp endpoint"]
+        Auth["API Key Auth<br/>middleware/auth.ts"]
+        Tools["18 MCP Tools"]
+        Telemetry["Telemetry Interceptor<br/>Logs every tool call"]
+
+        subgraph ToolGroups["Tool Modules"]
+            Memory["🧠 memory.ts<br/>store / search"]
+            Knowledge["📚 knowledge.ts<br/>store / search"]
+            Code["🔍 code.ts<br/>search / read / context<br/>impact / cypher"]
+            Quality["📋 quality.ts<br/>plan_quality / report"]
+            Session["🔄 session.ts<br/>start / end"]
+            Analytics["📊 analytics.ts<br/>tool_stats"]
+            Changes["🔀 changes.ts<br/>changes / detect"]
+            Health["💚 health.ts<br/>health / list_repos"]
+        end
+    end
+
+    subgraph API["⚡ corn-api :4000"]
+        direction TB
+        Hono["Hono REST API"]
+        Routes["15 Route Modules"]
+        AST["Native AST Engine<br/>TypeScript Compiler API"]
+        SQLite[("💾 SQLite<br/>corn.db")]
+        VectorDB[("🧲 SQLite Vector Store<br/>mem9-vectors.db")]
+    end
+
+    subgraph Dashboard["📊 corn-web :3000"]
+        NextJS["Next.js 16 Dashboard<br/>Turbopack"]
+    end
+
+    subgraph Embeddings["☁️ External (Optional)"]
+        Voyage["Voyage AI API<br/>voyage-code-3"]
+    end
+
+    Agent -->|"JSON-RPC over HTTP<br/>Bearer Token"| Transport
+    Transport --> Auth
+    Auth --> Tools
+    Tools --> Telemetry
+    Telemetry -->|"POST /api/metrics/query-log"| Hono
+
+    Memory -->|"Embeds + stores vectors"| VectorDB
+    Memory -.->|"Optional: Voyage AI"| Voyage
+    Knowledge -->|"Embeds + stores vectors"| VectorDB
+    Code -->|"POST /api/intel/*"| Hono
+    Quality -->|"POST /api/quality/*"| Hono
+    Session -->|"POST /api/sessions/*"| Hono
+    Analytics -->|"GET /api/analytics/*"| Hono
+    Changes -->|"POST /api/intel/detect-changes"| Hono
+    Health -->|"GET /health"| Hono
+
+    Hono --> Routes
+    Routes --> AST
+    Routes --> SQLite
+    AST --> SQLite
+    NextJS -->|"fetch() to :4000"| Hono
+
+    style IDE fill:#1a1a2e,stroke:#e94560,color:#fff
+    style MCP fill:#16213e,stroke:#0f3460,color:#fff
+    style API fill:#0f3460,stroke:#533483,color:#fff
+    style Dashboard fill:#533483,stroke:#e94560,color:#fff
+    style Embeddings fill:#2d2d2d,stroke:#666,color:#aaa
 ```
 
-> **No Docker required.** No external databases. No ghost services.
-> Everything runs natively with Node.js + SQLite.
+#### How It Works
+
+| Connection | Protocol | Description |
+|-----------|----------|-------------|
+| **IDE → corn-mcp** | JSON-RPC over HTTP | AI agent sends tool calls via MCP SDK. Bearer token auth required. |
+| **corn-mcp → corn-api** | REST HTTP (fetch) | Tool handlers call Dashboard API endpoints for data persistence. |
+| **corn-mcp → SQLite vectors** | Direct file I/O | Memory and knowledge tools embed content and store vectors locally. |
+| **corn-mcp → Voyage AI** | HTTPS API | Optional: semantic embeddings for memory/knowledge search. Falls back to local hash if unavailable. |
+| **corn-api → SQLite** | sql.js (in-process) | All data stored in `./data/corn.db` — sessions, quality, code graph, analytics. |
+| **corn-web → corn-api** | REST HTTP (fetch) | Dashboard fetches data from `:4000` API for real-time visualization. |
+| **Telemetry** | Fire-and-forget POST | Every tool call logs to `/api/metrics/query-log` for analytics dashboard. |
+
+---
+
+### 2. MCP Request Lifecycle
+
+> What happens step-by-step when your AI agent calls a Corn Hub tool.
+
+```mermaid
+sequenceDiagram
+    participant Agent as 🤖 AI Agent
+    participant IDE as 🖥️ IDE (MCP Client)
+    participant MCP as 🌽 corn-mcp
+    participant Auth as 🔐 Auth Middleware
+    participant Tool as 🔧 Tool Handler
+    participant API as ⚡ corn-api
+    participant DB as 💾 SQLite
+    participant Vec as 🧲 Vector Store
+    participant Embed as ☁️ Embeddings
+
+    Note over Agent,IDE: Agent decides to call corn_memory_store
+
+    Agent->>IDE: tools/call {name: "corn_memory_store", params: {...}}
+    IDE->>MCP: POST /mcp (JSON-RPC, Bearer token)
+
+    MCP->>Auth: validateApiKey(request)
+    Auth-->>MCP: ✅ valid (agentId: "local-ide")
+
+    MCP->>MCP: createMcpServer(env)
+    MCP->>MCP: new WebStandardStreamableHTTPServerTransport()
+    MCP->>MCP: mcpServer.connect(transport)
+
+    MCP->>Tool: corn_memory_store({content, projectId, tags})
+
+    Tool->>Embed: embed(["memory content"])
+    alt Voyage AI available
+        Embed-->>Tool: [0.12, -0.34, 0.56, ...] (1024 dims)
+    else Fallback
+        Embed-->>Tool: [hash-based vector] (256 dims)
+    end
+
+    Tool->>Vec: INSERT INTO vectors (id, embedding, payload)
+    Vec-->>Tool: ✅ stored
+
+    Tool-->>MCP: {content: [{type: "text", text: "✅ Memory stored (id: mem-abc123)"}]}
+
+    MCP->>API: POST /api/metrics/query-log (fire-and-forget telemetry)
+    Note over API: Logs: tool=corn_memory_store, status=ok, latency=401ms
+
+    MCP-->>IDE: JSON-RPC response
+    IDE-->>Agent: Tool result displayed
+
+    Note over Agent: Agent continues with stored memory context
+```
+
+#### Key Details
+
+- **Stateless**: Each request creates a fresh `McpServer` instance — no session state on the server
+- **Auth**: Bearer token validated against API keys stored in `corn-api` database
+- **Telemetry**: Every tool call is logged (tool name, status, latency, input size) as fire-and-forget
+- **Embedding Fallback**: If Voyage AI is rate-limited or unavailable, auto-rotates models then falls back to local hash embeddings
+- **Model Rotation**: `voyage-code-3` → `voyage-4-large` → `voyage-4` → `voyage-code-2` → `voyage-4-lite`
+
+---
+
+### 3. The 18 MCP Tools — Categories & Data Flow
+
+> Every tool grouped by category, showing what backend each one hits.
+
+```mermaid
+graph LR
+    subgraph Agent["🤖 AI Agent"]
+        Call["Tool Call"]
+    end
+
+    subgraph Memory["🧠 Memory (2 tools)"]
+        MS["corn_memory_store"]
+        MR["corn_memory_search"]
+    end
+
+    subgraph Knowledge["📚 Knowledge (2 tools)"]
+        KS["corn_knowledge_store"]
+        KR["corn_knowledge_search"]
+    end
+
+    subgraph CodeIntel["🔍 Code Intelligence (7 tools)"]
+        CS["corn_code_search"]
+        CR["corn_code_read"]
+        CC["corn_code_context"]
+        CI["corn_code_impact"]
+        CY["corn_cypher"]
+        LR2["corn_list_repos"]
+        DC["corn_detect_changes"]
+    end
+
+    subgraph QualityGates["📋 Quality (2 tools)"]
+        PQ["corn_plan_quality"]
+        QR2["corn_quality_report"]
+    end
+
+    subgraph Sessions["🔄 Sessions (2 tools)"]
+        SS["corn_session_start"]
+        SE["corn_session_end"]
+    end
+
+    subgraph Analytics2["📊 Analytics (2 tools)"]
+        TS["corn_tool_stats"]
+        CH["corn_changes"]
+    end
+
+    subgraph Health2["💚 Health (1 tool)"]
+        HE["corn_health"]
+    end
+
+    subgraph Backends["Backends"]
+        VecDB[("🧲 Vector Store<br/>SQLite")]
+        APIDB[("💾 corn-api<br/>SQLite")]
+        AST2["🏗️ AST Engine"]
+        Git["📂 Git CLI"]
+    end
+
+    Call --> Memory & Knowledge & CodeIntel & QualityGates & Sessions & Analytics2 & Health2
+
+    MS & MR --> VecDB
+    KS & KR --> VecDB
+    CS & CC & CI & CY & LR2 --> APIDB
+    CS & CC & CI --> AST2
+    CR --> Git
+    DC --> Git
+    DC --> AST2
+    PQ & QR2 --> APIDB
+    SS & SE --> APIDB
+    TS --> APIDB
+    CH --> APIDB
+    HE --> APIDB
+
+    style Agent fill:#e94560,stroke:#e94560,color:#fff
+    style Memory fill:#1a1a2e,stroke:#0f3460,color:#fff
+    style Knowledge fill:#1a1a2e,stroke:#0f3460,color:#fff
+    style CodeIntel fill:#16213e,stroke:#533483,color:#fff
+    style QualityGates fill:#0f3460,stroke:#e94560,color:#fff
+    style Sessions fill:#533483,stroke:#e94560,color:#fff
+    style Analytics2 fill:#2d2d2d,stroke:#666,color:#fff
+    style Health2 fill:#1b4332,stroke:#2d6a4f,color:#fff
+```
+
+#### Tool Reference
+
+| # | Tool | Category | Backend | Description |
+|---|------|----------|---------|-------------|
+| 1 | `corn_health` | Health | API | System health — services, uptime, version |
+| 2 | `corn_list_repos` | Code | API + AST | List indexed repositories with symbol counts |
+| 3 | `corn_code_search` | Code | AST → SQLite | Hybrid vector/AST symbol search |
+| 4 | `corn_code_read` | Code | Filesystem | Read raw source code from indexed repos |
+| 5 | `corn_code_context` | Code | AST → SQLite | 360° symbol view: callers, callees, hierarchy |
+| 6 | `corn_code_impact` | Code | AST → SQLite | Blast radius analysis with recursive CTE |
+| 7 | `corn_cypher` | Code | AST → SQLite | Cypher-to-SQL graph queries |
+| 8 | `corn_detect_changes` | Code | Git + AST | Uncommitted changes cross-referenced with graph |
+| 9 | `corn_memory_store` | Memory | Vector DB | Store agent memory with embedding |
+| 10 | `corn_memory_search` | Memory | Vector DB | Semantic similarity search over memories |
+| 11 | `corn_knowledge_store` | Knowledge | Vector DB | Store shared knowledge item |
+| 12 | `corn_knowledge_search` | Knowledge | Vector DB | Semantic search over knowledge base |
+| 13 | `corn_plan_quality` | Quality | API SQLite | Score a plan against 8 criteria (must ≥80%) |
+| 14 | `corn_quality_report` | Quality | API SQLite | Submit 4-dimension quality report (must ≥80%) |
+| 15 | `corn_session_start` | Session | API SQLite | Begin tracked work session |
+| 16 | `corn_session_end` | Session | API SQLite | End session with summary and decisions |
+| 17 | `corn_tool_stats` | Analytics | API SQLite | View tool usage analytics and trends |
+| 18 | `corn_changes` | Analytics | API SQLite | Check for recent commits by other agents |
+
+---
+
+### 4. Data Flow — From Code to Intelligence
+
+> How your codebase becomes a queryable knowledge graph.
+
+```mermaid
+flowchart TD
+    subgraph Input["📂 Your Codebase"]
+        Files["*.ts, *.tsx, *.js, *.jsx files"]
+    end
+
+    subgraph Indexing["🏗️ AST Engine (ast-engine.ts)"]
+        Collect["collectFiles()<br/>Recursively scan project<br/>Skip: node_modules, dist, .git"]
+        Parse["ts.createProgram()<br/>TypeScript Compiler API<br/>Full type-aware parsing"]
+        Extract["AST Walk<br/>Extract symbols + edges"]
+        Store["SQLite Persist<br/>INSERT into code_symbols<br/>INSERT into code_edges"]
+    end
+
+    subgraph Symbols["📊 Extracted Data"]
+        SymTable["code_symbols table<br/>965 rows"]
+        EdgeTable["code_edges table<br/>407 rows"]
+    end
+
+    subgraph Queries["🔍 Query Layer (intel.ts)"]
+        Search["searchSymbols()<br/>LIKE + ranking"]
+        Context["getSymbolContext()<br/>JOIN callers/callees/imports"]
+        Impact["getSymbolImpact()<br/>Recursive CTE traversal"]
+        Cypher["executeCypher()<br/>Cypher → SQL translation"]
+    end
+
+    subgraph MCPTools["🌽 MCP Tool Surface"]
+        T1["corn_code_search"]
+        T2["corn_code_context"]
+        T3["corn_code_impact"]
+        T4["corn_cypher"]
+    end
+
+    subgraph AgentUse["🤖 Agent Uses"]
+        Understand["Understand codebase<br/>architecture"]
+        PlanChanges["Plan changes with<br/>blast radius awareness"]
+        Navigate["Navigate call graphs<br/>and dependencies"]
+        Refactor["Safe refactoring with<br/>impact analysis"]
+    end
+
+    Files --> Collect --> Parse --> Extract --> Store
+    Store --> SymTable & EdgeTable
+    SymTable & EdgeTable --> Search & Context & Impact & Cypher
+    Search --> T1
+    Context --> T2
+    Impact --> T3
+    Cypher --> T4
+    T1 --> Understand
+    T2 --> Navigate
+    T3 --> PlanChanges
+    T4 --> Refactor
+
+    style Input fill:#1a1a2e,stroke:#e94560,color:#fff
+    style Indexing fill:#16213e,stroke:#0f3460,color:#fff
+    style Symbols fill:#0f3460,stroke:#533483,color:#fff
+    style Queries fill:#533483,stroke:#e94560,color:#fff
+    style MCPTools fill:#e94560,stroke:#fff,color:#fff
+    style AgentUse fill:#2d6a4f,stroke:#40916c,color:#fff
+```
+
+#### Symbol Extraction Details
+
+| Symbol Kind | Example | What's Captured |
+|-------------|---------|-----------------|
+| **Function** | `createLogger()` | Name, params, return type, file, lines, exported?, signature |
+| **Class** | `CornError` | Name, extends, implements, methods, properties |
+| **Interface** | `Logger` | Name, members, extends |
+| **Type** | `LogLevel` | Name, definition |
+| **Enum** | `HttpStatus` | Name, members |
+| **Variable** | `app` | Name, type annotation, initializer |
+
+#### Edge Types
+
+| Edge | Meaning | Example |
+|------|---------|---------|
+| `calls` | Function A calls Function B | `start()` → `getDb()` |
+| `imports` | File A imports from File B | `index.ts` → `@corn/shared-utils` |
+| `extends` | Class A extends Class B | `NotFoundError` → `CornError` |
+| `implements` | Class implements Interface | `LocalHashEmbeddingProvider` → `EmbeddingProvider` |
+
+> **Performance**: Corn Hub indexes itself (49 files) in ~2 seconds, extracting 965 symbols and 407 edges.
 
 ---
 
