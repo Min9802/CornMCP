@@ -1,0 +1,157 @@
+# Corn Hub — Docker Compose Stack
+# Services: Qdrant, Dashboard API, MCP Server, Dashboard Web, Watchtower
+
+services:
+  # ─────────────────────────────────────────────
+  # Qdrant — Vector Database
+  # ─────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    container_name: corn-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '(echo > /dev/tcp/localhost/6333) 2>/dev/null'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ─────────────────────────────────────────────
+  # Corn Dashboard API (+ mem9 in-process)
+  # ─────────────────────────────────────────────
+  corn-api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.corn-api
+      args:
+        COMMIT_SHA: ${COMMIT_SHA:-dev}
+        BUILD_DATE: ${BUILD_DATE:-}
+    image: corn-api:latest
+    container_name: corn-api
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    volumes:
+      - api-data:/app/data
+    environment:
+      PORT: 4000
+      NODE_ENV: production
+      DATABASE_PATH: /app/data/corn.db
+      QDRANT_URL: http://qdrant:6333
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      MEM9_EMBEDDING_MODEL: ${MEM9_EMBEDDING_MODEL:-text-embedding-3-small}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:4000/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ─────────────────────────────────────────────
+  # Corn MCP Gateway (18 tools)
+  # ─────────────────────────────────────────────
+  corn-mcp:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.corn-mcp
+    image: corn-mcp:latest
+    container_name: corn-mcp
+    restart: unless-stopped
+    ports:
+      - "8317:8317"
+    environment:
+      PORT: 8317
+      NODE_ENV: production
+      DASHBOARD_API_URL: http://corn-api:4000
+      QDRANT_URL: http://qdrant:6333
+      MCP_SERVER_NAME: "corn-hub"
+      MCP_SERVER_VERSION: "0.1.0"
+      API_KEYS: ${MCP_API_KEYS:-}
+    depends_on:
+      corn-api:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8317/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ─────────────────────────────────────────────
+  # Corn Dashboard Web (Next.js static via nginx)
+  # ─────────────────────────────────────────────
+  corn-web:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.corn-web
+    image: corn-web:latest
+    container_name: corn-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      corn-api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/ > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ─────────────────────────────────────────────
+  # Watchtower — Auto-update containers
+  # ─────────────────────────────────────────────
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: corn-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: 300
+      WATCHTOWER_LABEL_ENABLE: "false"
+      DOCKER_API_VERSION: "1.43"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  qdrant-data:
+    name: corn-qdrant-data
+  api-data:
+    name: corn-api-data

@@ -1,0 +1,28 @@
+{
+  "name": "@corn/corn-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "corn-mcp": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/node.ts",
+    "build": "tsc",
+    "start": "node dist/node.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@corn/shared-types": "workspace:*",
+    "@corn/shared-utils": "workspace:*",
+    "@corn/shared-mem9": "workspace:*",
+    "@hono/node-server": "^1.14.0",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "hono": "^4.7.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

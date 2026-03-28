@@ -1,0 +1,80 @@
+.heroBar {
+  display: flex; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-6);
+}
+.statPill {
+  display: flex; align-items: center; gap: var(--space-3);
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-5); flex: 1; min-width: 140px;
+  transition: all 0.2s ease;
+}
+.statPill:hover { border-color: var(--corn-gold); box-shadow: var(--shadow-glow); }
+.statIcon { font-size: 1.3rem; }
+.statContent { display: flex; flex-direction: column; }
+.statValue { font-size: 1.1rem; font-weight: 700; }
+.statLabel { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* Services */
+.servicesStrip {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: var(--space-4) var(--space-6); margin-bottom: var(--space-6);
+}
+.servicesLeft { display: flex; align-items: center; gap: var(--space-6); }
+.stripTitle { font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); }
+.servicesRow { display: flex; gap: var(--space-5); }
+.serviceDot { display: flex; align-items: center; gap: var(--space-2); }
+.serviceName { font-size: 0.85rem; color: var(--text-secondary); }
+
+/* Two Column */
+.twoCol { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-6); }
+@media (max-width: 900px) { .twoCol { grid-template-columns: 1fr; } }
+
+/* Sections */
+.sectionTitle { font-size: 1rem; font-weight: 600; margin-bottom: var(--space-4); }
+.sectionHeader { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-4); }
+
+/* Intel Cards */
+.intelCard { margin-bottom: var(--space-4); }
+.intelHeader { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-4); font-weight: 600; }
+.intelLink { font-size: 0.8rem; color: var(--corn-gold); }
+.intelGrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); }
+.intelStat { text-align: center; }
+.intelValue { display: block; font-size: 1.3rem; font-weight: 700; }
+.intelLabel { display: block; font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; margin-top: 2px; }
+
+/* Activity */
+.activityCard { padding: 0; overflow: hidden; }
+.activityList { max-height: 400px; overflow-y: auto; }
+.activityRow {
+  display: flex; align-items: center; gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  transition: background 0.15s ease;
+}
+.activityRow:hover { background: var(--bg-card-hover); }
+.activityRow:last-child { border-bottom: none; }
+.activityIcon { font-size: 1rem; }
+.activityInfo { flex: 1; min-width: 0; }
+.activityDetail { display: block; font-weight: 500; font-size: 0.85rem; }
+.activityMeta { font-size: 0.75rem; color: var(--text-muted); }
+.activityRight { display: flex; align-items: center; gap: var(--space-3); }
+.activityTime { font-size: 0.75rem; color: var(--text-muted); white-space: nowrap; }
+
+/* Gauge */
+.gaugeCard { text-align: center; padding: var(--space-4); }
+.gaugeSvg { width: 90px; height: 90px; }
+.gaugeCenter { margin-top: -60px; margin-bottom: 10px; }
+.gaugeValue { font-size: 1rem; font-weight: 700; }
+.gaugeLabel { font-size: 0.8rem; color: var(--text-secondary); }
+
+/* Empty */
+.emptyState { text-align: center; padding: var(--space-10); color: var(--text-muted); }
+.emptyState span { font-size: 2rem; display: block; margin-bottom: var(--space-3); }
+
+/* Connect */
+.connectCard { }
+.connectText { color: var(--text-secondary); margin-bottom: var(--space-4); }
+.codeBlock {
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-md);
+  padding: var(--space-4); overflow-x: auto; font-size: 0.8rem; color: var(--corn-gold);
+}

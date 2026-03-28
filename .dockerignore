@@ -1,0 +1,15 @@
+node_modules
+.git
+.github
+.env
+*.log
+*.md
+!README.md
+dist
+.next
+out
+.turbo
+.cache
+infra/.env
+data/
+apps/corn-api/data/

@@ -1,0 +1,107 @@
+# syntax=docker/dockerfile:1
+# ──────────────────────────────────────────────
+# Corn Dashboard API — Multi-stage Build
+# Pure JS (sql.js) — no native compilation needed
+# ──────────────────────────────────────────────
+
+# Stage 1: Base
+FROM node:22-slim AS base
+RUN corepack enable
+RUN echo "node-linker=hoisted" > /root/.npmrc && echo "shamefully-hoist=true" >> /root/.npmrc
+
+# Stage 2: Install deps
+FROM base AS deps
+WORKDIR /app
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc* ./
+COPY apps/corn-api/package.json ./apps/corn-api/
+COPY apps/corn-web/package.json ./apps/corn-web/
+COPY packages/shared-utils/package.json ./packages/shared-utils/
+COPY packages/shared-types/package.json ./packages/shared-types/
+COPY packages/shared-mem9/package.json ./packages/shared-mem9/
+
+RUN echo "node-linker=hoisted" > .npmrc && echo "shamefully-hoist=true" >> .npmrc
+
+RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
+    pnpm install --no-frozen-lockfile
+
+# Stage 3: Build
+FROM deps AS builder
+WORKDIR /app
+
+ARG COMMIT_SHA=unknown
+ARG BUILD_DATE=unknown
+
+COPY . .
+
+RUN npx turbo build --filter=@corn/corn-api --filter=@corn/corn-web
+
+# Stage 4: Production deps
+FROM base AS prod-deps
+WORKDIR /app
+
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/pnpm-lock.yaml ./pnpm-lock.yaml
+COPY --from=builder /app/pnpm-workspace.yaml ./pnpm-workspace.yaml
+COPY --from=builder /app/apps/corn-api/package.json ./apps/corn-api/package.json
+COPY --from=builder /app/packages/shared-utils/package.json ./packages/shared-utils/package.json
+COPY --from=builder /app/packages/shared-types/package.json ./packages/shared-types/package.json
+COPY --from=builder /app/packages/shared-mem9/package.json ./packages/shared-mem9/package.json
+
+RUN echo "node-linker=hoisted" > .npmrc && echo "shamefully-hoist=true" >> .npmrc
+
+RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
+    pnpm install --no-frozen-lockfile --prod --ignore-scripts
+
+# Stage 5: Runner
+FROM node:22-slim AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV PORT=4000
+ARG COMMIT_SHA=unknown
+ARG BUILD_DATE=unknown
+ENV COMMIT_SHA=${COMMIT_SHA}
+ENV BUILD_DATE=${BUILD_DATE}
+
+# Copy production node_modules
+COPY --from=prod-deps /app/node_modules ./node_modules
+
+# Copy built artifacts
+COPY --from=builder /app/apps/corn-api/dist ./apps/corn-api/dist
+COPY --from=builder /app/packages/shared-utils/dist ./packages/shared-utils/dist
+COPY --from=builder /app/packages/shared-types/dist ./packages/shared-types/dist
+COPY --from=builder /app/packages/shared-mem9/dist ./packages/shared-mem9/dist
+
+# Workspace symlinks for ESM resolution
+RUN mkdir -p /app/node_modules/@corn && \
+    ln -sf /app/packages/shared-utils /app/node_modules/@corn/shared-utils && \
+    ln -sf /app/packages/shared-types /app/node_modules/@corn/shared-types && \
+    ln -sf /app/packages/shared-mem9 /app/node_modules/@corn/shared-mem9
+
+# Runtime assets
+RUN mkdir -p /app/apps/corn-api/dist/db
+COPY --from=builder /app/apps/corn-api/src/db/schema.sql ./apps/corn-api/dist/db/schema.sql
+COPY --from=builder /app/version.json ./version.json
+
+# Dashboard Web static export
+RUN mkdir -p /app/public
+COPY --from=builder /app/apps/corn-web/out/ ./public/ 2>/dev/null || true
+
+# Metadata for ESM
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/apps/corn-api/package.json ./apps/corn-api/package.json
+COPY --from=builder /app/packages/shared-utils/package.json ./packages/shared-utils/package.json
+COPY --from=builder /app/packages/shared-types/package.json ./packages/shared-types/package.json
+COPY --from=builder /app/packages/shared-mem9/package.json ./packages/shared-mem9/package.json
+COPY --from=builder /app/pnpm-workspace.yaml ./pnpm-workspace.yaml
+
+# Data directories
+RUN mkdir -p /app/data
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD node -e "fetch('http://localhost:4000/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
+
+EXPOSE 4000
+
+CMD ["node", "apps/corn-api/dist/index.js"]
