@@ -37,8 +37,10 @@ app.get('/health', async (c) => {
   }
 
   const qdrantUrl = process.env['QDRANT_URL'] || 'http://localhost:6333'
-  const [qdrant] = await Promise.all([
+  const mcpUrl = process.env['MCP_URL'] || 'http://localhost:8317'
+  const [qdrant, mcp] = await Promise.all([
     checkService('qdrant', `${qdrantUrl}/healthz`),
+    checkService('mcp', `${mcpUrl}/health`),
   ])
 
   return c.json({
@@ -47,7 +49,7 @@ app.get('/health', async (c) => {
     version: '0.1.0',
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
-    services: { qdrant },
+    services: { qdrant, api: 'ok' as const, mcp },
   })
 })
 

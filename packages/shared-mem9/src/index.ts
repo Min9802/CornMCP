@@ -196,24 +196,40 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embed(texts: string[]): Promise<number[][]> {
-    const res = await fetch(`${this.apiBase}/embeddings`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({ input: texts, model: this.model }),
-    })
-    if (!res.ok) {
+    let retries = 3
+    let delay = 2000
+
+    while (retries >= 0) {
+      const res = await fetch(`${this.apiBase}/embeddings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({ input: texts, model: this.model }),
+      })
+
+      if (res.ok) {
+        const data = (await res.json()) as { data: { embedding: number[] }[] }
+        return data.data.map((d) => d.embedding)
+      }
+
       const text = await res.text()
+      
+      // Handle 429 Too Many Requests (Voyage free tier limit)
+      if (res.status === 429 && retries > 0) {
+        retries--
+        await new Promise((r) => setTimeout(r, delay))
+        delay *= 2
+        continue
+      }
+      
       throw new Error(`Embedding API failed: ${text}`)
     }
-    const data = (await res.json()) as {
-      data: { embedding: number[] }[]
-    }
-    return data.data.map((d) => d.embedding)
+    throw new Error(`Embedding API failed after retries`)
   }
 }
+
 
 // ─── SQLite Vector Store (replaces Qdrant) ──────────────
 

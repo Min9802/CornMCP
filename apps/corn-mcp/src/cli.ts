@@ -90,10 +90,63 @@ async function run() {
   const server = createMcpServer(envWithOwner)
   const transport = new StdioServerTransport()
 
+  // ─── Telemetry Interceptor for STDIO ───
+  // IMPORTANT: We must install interceptors AFTER server.connect() because
+  // the MCP SDK only assigns transport.onmessage during connect().
+  // Before connect(), transport.onmessage is undefined.
+  const pendingReqs = new Map<any, { tool: string; start: number; inputSize: number }>()
+  const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
+
+  // Intercept outgoing responses (send) — must be set BEFORE connect so the
+  // SDK's internal calls go through our wrapper from the start.
+  const origSend = transport.send.bind(transport)
+  transport.send = async (message: any) => {
+    if (message && message.id && pendingReqs.has(message.id)) {
+      const req = pendingReqs.get(message.id)!
+      pendingReqs.delete(message.id)
+
+      const latencyMs = Date.now() - req.start
+      const status = message.error ? 'error' : 'ok'
+
+      fetch(`${apiUrl}/api/metrics/query-log`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentId: envWithOwner.API_KEY_OWNER,
+          tool: req.tool,
+          status,
+          latencyMs,
+          inputSize: req.inputSize,
+        }),
+      }).catch(() => {})
+    }
+    return origSend(message)
+  }
+
   try {
     await server.connect(transport)
+
+    // Now install the onmessage interceptor AFTER connect(), since connect()
+    // is what sets up transport.onmessage in the first place.
+    const sdkOnMessage = transport.onmessage
+    if (sdkOnMessage) {
+      transport.onmessage = (message: any) => {
+        if (message && message.method === 'tools/call' && message.id) {
+          const toolName = message.params?.name || 'unknown'
+          pendingReqs.set(message.id, {
+            tool: toolName,
+            start: Date.now(),
+            inputSize: JSON.stringify(message).length,
+          })
+          console.error(`[telemetry] 🔧 ${toolName} called`)
+        }
+        return sdkOnMessage.call(transport, message)
+      }
+    }
+
     console.error('🌽 Corn MCP Server running locally via STDIO transport')
     console.error(`   Embedding: ${process.env['OPENAI_API_BASE'] || 'https://api.voyageai.com/v1'} (${process.env['MEM9_EMBEDDING_MODEL'] || 'voyage-code-3'})`)
+    console.error(`   Telemetry: logging to ${apiUrl}`)
   } catch (error) {
     console.error('Fatal error starting Corn MCP Server:', error)
     process.exit(1)

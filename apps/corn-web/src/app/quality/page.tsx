@@ -34,7 +34,7 @@ export default function QualityPage() {
       )}
 
       {/* Reports Table */}
-      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="table-container animate-in" style={{ padding: 0, overflow: 'hidden' }}>
         <table className="table">
           <thead>
             <tr>
@@ -53,9 +53,9 @@ export default function QualityPage() {
             {data?.reports && data.reports.length > 0 ? (
               data.reports.map((r: any) => (
                 <tr key={r.id}>
-                  <td><span className={`grade-${r.grade}`} style={{ fontWeight: 800, fontSize: '1.2rem' }}>{r.grade}</span></td>
+                  <td><span className={`grade-${r.grade}`} style={{ fontWeight: 800, fontSize: '1.2rem', textShadow: '0 0 10px rgba(currentColor, 0.4)' }}>{r.grade}</span></td>
                   <td style={{ fontWeight: 600 }}>{r.score_total}/100</td>
-                  <td><code style={{ color: 'var(--corn-gold)', fontSize: '0.8rem' }}>{r.gate_name}</code></td>
+                  <td><code style={{ color: 'var(--corn-gold)', fontSize: '0.8rem', background: 'rgba(251, 191, 36, 0.1)', padding: '2px 6px', borderRadius: '4px' }}>{r.gate_name}</code></td>
                   <td>{r.agent_id}</td>
                   <td>{r.score_build}/25</td>
                   <td>{r.score_regression}/25</td>

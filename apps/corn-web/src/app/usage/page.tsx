@@ -37,9 +37,9 @@ export default function UsagePage() {
       </div>
 
       {/* By Model */}
-      <div className="card" style={{ marginBottom: 'var(--space-6)', padding: 0, overflow: 'hidden' }}>
-        <div style={{ padding: 'var(--space-4) var(--space-6)', borderBottom: '1px solid var(--border)' }}>
-          <h3 style={{ fontWeight: 600 }}>📈 Token Usage by Model</h3>
+      <div className="table-container animate-in" style={{ marginBottom: 'var(--space-6)', padding: 0, overflow: 'hidden' }}>
+        <div style={{ padding: 'var(--space-4) var(--space-6)', borderBottom: '1px solid rgba(255, 255, 255, 0.05)', background: 'linear-gradient(90deg, rgba(251, 191, 36, 0.05) 0%, transparent 100%)' }}>
+          <h3 style={{ fontWeight: 600, textShadow: '0 2px 4px rgba(0,0,0,0.5)' }}>📈 Token Usage by Model</h3>
         </div>
         <table className="table">
           <thead>
@@ -55,10 +55,10 @@ export default function UsagePage() {
             {data?.byModel && data.byModel.length > 0 ? (
               data.byModel.map((m: any, i: number) => (
                 <tr key={i}>
-                  <td style={{ fontWeight: 600 }}><code style={{ color: 'var(--corn-gold)', fontSize: '0.85rem' }}>{m.model}</code></td>
+                  <td style={{ fontWeight: 600 }}><code style={{ color: 'var(--corn-gold)', fontSize: '0.85rem', background: 'rgba(251, 191, 36, 0.1)', padding: '2px 6px', borderRadius: '4px' }}>{m.model}</code></td>
                   <td>{formatTokens(m.prompt_tokens)}</td>
                   <td>{formatTokens(m.completion_tokens)}</td>
-                  <td style={{ fontWeight: 600 }}>{formatTokens(m.total_tokens)}</td>
+                  <td style={{ fontWeight: 600, color: 'var(--corn-teal)' }}>{formatTokens(m.total_tokens)}</td>
                   <td>{m.requests}</td>
                 </tr>
               ))
@@ -72,9 +72,9 @@ export default function UsagePage() {
       </div>
 
       {/* By Agent */}
-      <div className="card" style={{ marginBottom: 'var(--space-6)', padding: 0, overflow: 'hidden' }}>
-        <div style={{ padding: 'var(--space-4) var(--space-6)', borderBottom: '1px solid var(--border)' }}>
-          <h3 style={{ fontWeight: 600 }}>🤖 Usage by Agent</h3>
+      <div className="table-container animate-in" style={{ marginBottom: 'var(--space-6)', padding: 0, overflow: 'hidden' }}>
+        <div style={{ padding: 'var(--space-4) var(--space-6)', borderBottom: '1px solid rgba(255, 255, 255, 0.05)', background: 'linear-gradient(90deg, rgba(34, 197, 94, 0.05) 0%, transparent 100%)' }}>
+          <h3 style={{ fontWeight: 600, textShadow: '0 2px 4px rgba(0,0,0,0.5)' }}>🤖 Usage by Agent</h3>
         </div>
         <table className="table">
           <thead>
@@ -84,8 +84,8 @@ export default function UsagePage() {
             {data?.byAgent && data.byAgent.length > 0 ? (
               data.byAgent.map((a: any, i: number) => (
                 <tr key={i}>
-                  <td style={{ fontWeight: 600 }}>{a.agent_id}</td>
-                  <td>{formatTokens(a.total_tokens)}</td>
+                  <td style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{a.agent_id}</td>
+                  <td style={{ color: 'var(--corn-teal)' }}>{formatTokens(a.total_tokens)}</td>
                   <td>{a.requests}</td>
                 </tr>
               ))

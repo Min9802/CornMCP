@@ -165,6 +165,27 @@ This means the path in your MCP config does not match where Corn Hub is installe
 
 ## 📋 Changelog
 
+### v0.1.2 — 2026-03-28
+
+#### 🐛 Bug Fixes
+- **STDIO telemetry never fired** — The tool call interceptor in `cli.ts` was checking `transport.onmessage` BEFORE `server.connect()`, but the MCP SDK only assigns that handler DURING `connect()`. It was always `undefined`, so zero tool calls were ever logged to the dashboard. Fixed by moving interceptor installation to AFTER `connect()`.
+- **GitNexus 500 crashes** — All code intelligence tools (`corn_code_search`, `corn_code_impact`, `corn_code_context`, `corn_detect_changes`, `corn_cypher`) crashed with raw stack traces when GitNexus backend was unavailable. Fixed with try-catch wrappers that return descriptive error messages and allow `corn_code_search` to gracefully degrade to Qdrant semantic search.
+- **Voyage AI rate limit crashes** — The `OpenAIEmbeddingProvider` in `shared-mem9` had no retry logic for `429 Too Many Requests`. Added exponential backoff (3 retries, 2s base delay) to survive the free-tier 3 RPM limit.
+- **Dashboard service dots yellow** — The `/health` endpoint only returned `{services: {qdrant}}` but the frontend expected `api` and `mcp` keys too. Added MCP health check and always includes `api: 'ok'`.
+
+#### 🎨 UI Improvements
+- **Premium table design** — Replaced basic table CSS with glassmorphic aesthetics: `backdrop-filter: blur(12px)`, sticky translucent headers, `scale(1.002)` hover micro-animations, gold accent borders, and gradient header backgrounds
+- **Upgraded Quality, Sessions, and Usage pages** to use the new `table-container` design system
+
+#### 🔧 Infrastructure
+- Added `MCP_URL` env var to `docker-compose.yml` so `corn-api` can health-check `corn-mcp` inside Docker
+- Added STDIO telemetry interceptor: every tool call from local IDE now logs agent, tool, latency, status to the dashboard database
+
+#### 📋 Quality Enforcement
+- **Mandatory quality gate workflow** (`.agent/workflows/corn-quality-gates.md`) — ALL tasks must now go through: `corn_tool_stats` → `corn_changes` → `corn_session_start` → `corn_memory_search` → `corn_plan_quality` (≥80% or REJECTED) → `corn_quality_report` (≥60/100) → `corn_session_end`
+
+---
+
 ### v0.1.1 — 2026-03-28
 
 #### 🐛 Bug Fixes

@@ -17,7 +17,7 @@ export default function SessionsPage() {
 
   return (
     <DashboardLayout title="Sessions" subtitle="Agent work sessions and handoffs">
-      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="table-container animate-in" style={{ padding: 0, overflow: 'hidden' }}>
         <table className="table">
           <thead>
             <tr>

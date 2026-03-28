@@ -32,9 +32,12 @@ export function registerCodeTools(server: McpServer, env: McpEnv) {
     },
     async ({ query, projectId, branch, limit }) => {
       try {
-        const data = (await callIntel('search', {
-          query, projectId, branch, limit: limit ?? 5,
-        })) as { data?: { formatted?: string }; success?: boolean }
+        let data: { data?: { formatted?: string }; success?: boolean } = { success: false }
+        try {
+          data = (await callIntel('search', {
+            query, projectId, branch, limit: limit ?? 5,
+          })) as any
+        } catch { /* GitNexus fail (500) - continue to Qdrant semantic search fallback */ }
 
         let formatted = data?.data?.formatted ?? ''
 
@@ -122,7 +125,7 @@ export function registerCodeTools(server: McpServer, env: McpEnv) {
 
         return { content: [{ type: 'text' as const, text: raw || JSON.stringify(data, null, 2) }] }
       } catch (error) {
-        return { content: [{ type: 'text' as const, text: `Impact analysis error: ${error instanceof Error ? error.message : 'Unknown'}` }], isError: true }
+        return { content: [{ type: 'text' as const, text: `Impact analysis requires GitNexus AST engine, which is currently unavailable (${error instanceof Error ? error.message : 'Unknown'})` }], isError: true }
       }
     },
   )
@@ -141,7 +144,7 @@ export function registerCodeTools(server: McpServer, env: McpEnv) {
         const data = (await callIntel('context', { name, projectId, file })) as { data?: { results?: { raw?: string } } }
         return { content: [{ type: 'text' as const, text: data?.data?.results?.raw ?? JSON.stringify(data, null, 2) }] }
       } catch (error) {
-        return { content: [{ type: 'text' as const, text: `Context error: ${error instanceof Error ? error.message : 'Unknown'}` }], isError: true }
+        return { content: [{ type: 'text' as const, text: `Context analysis requires GitNexus AST engine, which is currently unavailable (${error instanceof Error ? error.message : 'Unknown'})` }], isError: true }
       }
     },
   )
@@ -159,7 +162,7 @@ export function registerCodeTools(server: McpServer, env: McpEnv) {
         const data = await callIntel('detect-changes', { scope: scope ?? 'all', projectId })
         return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] }
       } catch (error) {
-        return { content: [{ type: 'text' as const, text: `Detect changes error: ${error instanceof Error ? error.message : 'Unknown'}` }], isError: true }
+        return { content: [{ type: 'text' as const, text: `Change detection requires GitNexus AST engine, which is currently unavailable (${error instanceof Error ? error.message : 'Unknown'})` }], isError: true }
       }
     },
   )
@@ -181,7 +184,7 @@ export function registerCodeTools(server: McpServer, env: McpEnv) {
         const hint = msg.includes('Cannot find property')
           ? '\n\n💡 Available properties: name, filePath. Use labels(n) for node type.'
           : ''
-        return { content: [{ type: 'text' as const, text: `Cypher error: ${msg}${hint}` }], isError: true }
+        return { content: [{ type: 'text' as const, text: `Cypher graph engine (GitNexus) is currently unavailable (${msg})${hint}` }], isError: true }
       }
     },
   )
