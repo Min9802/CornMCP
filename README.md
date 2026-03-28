@@ -275,7 +275,7 @@ Every task follows this enforced pipeline:
 │  End         │     │  Report      │
 │              │     │              │
 │ • knowledge  │     │  Score must  │
-│ • memory     │     │  be ≥60/100  │
+│ • memory     │     │  be ≥80/100  │
 │ • end        │     │  or FAIL     │
 │ • stats      │     │              │
 └──────────────┘     └──────────────┘
