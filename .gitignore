@@ -8,3 +8,4 @@ dist/
 .next/
 out/
 data/
+package-lock.json

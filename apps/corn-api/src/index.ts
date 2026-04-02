@@ -18,11 +18,19 @@ import { webhooksRouter } from './routes/webhooks.js'
 import { intelRouter } from './routes/intel.js'
 import { systemRouter } from './routes/system.js'
 import { indexingRouter } from './routes/indexing.js'
+import { authRouter } from './routes/auth.js'
+import { usersRouter } from './routes/users.js'
 
 const app = new Hono()
 const logger = createLogger('corn-api')
 
-app.use('*', cors())
+const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:3000'
+app.use('*', cors({
+  origin: corsOrigin,
+  credentials: true,
+  allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+}))
 app.use('*', honoLogger())
 
 // ─── Health ─────────────────────────────────────────────
@@ -62,6 +70,8 @@ app.get('/health', async (c) => {
 })
 
 // ─── Routes ─────────────────────────────────────────────
+app.route('/api/auth', authRouter)
+app.route('/api/users', usersRouter)
 app.route('/api/keys', keysRouter)
 app.route('/api/sessions', sessionsRouter)
 app.route('/api/quality', qualityRouter)
@@ -107,8 +117,8 @@ async function start() {
   await getDb()
   logger.info('Database ready')
 
-  serve({ fetch: app.fetch, port }, () => {
-    logger.info(`🌽 Corn Dashboard API listening on http://localhost:${port}`)
+  serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, () => {
+    logger.info(`🌽 Corn Dashboard API listening on http://0.0.0.0:${port}`)
   })
 }
 

@@ -3,6 +3,12 @@ import { z } from 'zod'
 import type { McpEnv } from '@corn/shared-types'
 import { generateId } from '@corn/shared-utils'
 
+function apiHeaders(env: McpEnv): Record<string, string> {
+  const h: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (env.DASHBOARD_API_KEY) h['X-API-Key'] = env.DASHBOARD_API_KEY
+  return h
+}
+
 /** Build a visual bar: ████████░░ (filled vs empty blocks, max width) */
 function scoreBar(score: number, max: number, width = 10): string {
   const filled = Math.round((score / max) * width)
@@ -45,7 +51,7 @@ export function registerQualityTools(server: McpServer, env: McpEnv) {
         const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
         await fetch(`${apiUrl}/api/quality`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: apiHeaders(env),
           body: JSON.stringify({
             id: reportId,
             projectId,

@@ -3,6 +3,12 @@ import { z } from 'zod'
 import type { McpEnv } from '@corn/shared-types'
 import { generateId } from '@corn/shared-utils'
 
+function apiHeaders(env: McpEnv): Record<string, string> {
+  const h: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (env.DASHBOARD_API_KEY) h['X-API-Key'] = env.DASHBOARD_API_KEY
+  return h
+}
+
 export function registerSessionTools(server: McpServer, env: McpEnv) {
   // ─── Start Session ───────────────────────────────────
   server.tool(
@@ -22,7 +28,7 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
         const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
         await fetch(`${apiUrl}/api/sessions`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: apiHeaders(env),
           body: JSON.stringify({
             id: sessionId,
             agentId,
@@ -67,7 +73,7 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
         const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
         await fetch(`${apiUrl}/api/sessions/${sessionId}`, {
           method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
+          headers: apiHeaders(env),
           body: JSON.stringify({
             status: 'completed',
             summary,

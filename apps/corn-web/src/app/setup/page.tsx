@@ -1,6 +1,19 @@
+'use client'
 import DashboardLayout from "@/components/layout/DashboardLayout"
 
+function useServiceUrls() {
+  if (typeof window === 'undefined') return { host: 'localhost', apiUrl: '', mcpUrl: '', webUrl: '' }
+  const host = window.location.hostname
+  return {
+    host,
+    apiUrl: `http://${host}:4000`,
+    mcpUrl: `http://${host}:8317`,
+    webUrl: `http://${host}:3000`,
+  }
+}
+
 export default function SetupPage() {
+  const { host, apiUrl, mcpUrl } = useServiceUrls()
   return (
     <DashboardLayout title="Installation" subtitle="Get Corn Hub running in your IDE in under 2 minutes">
 
@@ -36,8 +49,8 @@ export default function SetupPage() {
         </h3>
         <pre style={{ background: 'rgba(0,0,0,0.4)', borderRadius: 'var(--radius-md)', padding: 'var(--space-4)', overflow: 'auto', fontSize: '0.85rem', lineHeight: 1.6, border: '1px solid rgba(255,255,255,0.06)' }}>
           <code style={{ color: '#e2e8f0' }}>{`# Clone the repository
-git clone https://github.com/yuki-20/corn-hub.git
-cd corn-hub
+git clone https://github.com/Min9802/CornMCP.git
+cd CornMCP
 
 # Install dependencies & build
 pnpm install
@@ -61,11 +74,24 @@ pnpm build`}</code>
             <span style={{ color: 'var(--corn-blue)' }}>⚡</span> Antigravity / Codex (VS Code)
           </div>
           <pre style={{ background: 'rgba(0,0,0,0.4)', borderRadius: 'var(--radius-md)', padding: 'var(--space-4)', overflow: 'auto', fontSize: '0.82rem', lineHeight: 1.5, border: '1px solid rgba(255,255,255,0.06)' }}>
-            <code style={{ color: '#e2e8f0' }}>{`{
+            <code style={{ color: '#e2e8f0' }}>{`// STDIO (local):
+{
   "mcpServers": {
     "corn": {
       "command": "node",
       "args": ["/path/to/corn-hub/apps/corn-mcp/dist/cli.js"]
+    }
+  }
+}
+
+// HTTP (remote):
+{
+  "mcpServers": {
+    "corn-hub": {
+      "url": "${mcpUrl}/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-api-key>"
+      }
     }
   }
 }`}</code>
@@ -107,14 +133,14 @@ pnpm build`}</code>
         </pre>
         <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
           {[
-            { name: 'Dashboard', port: ':3000', color: 'var(--corn-blue)' },
-            { name: 'API', port: ':4000', color: 'var(--corn-green)' },
-            { name: 'MCP Gateway', port: ':8317', color: 'var(--corn-teal)' },
-            { name: 'Qdrant', port: ':6333', color: 'var(--corn-gold)' },
+            { name: 'Dashboard', url: `${host}:3000`, color: 'var(--corn-blue)' },
+            { name: 'API', url: `${host}:4000`, color: 'var(--corn-green)' },
+            { name: 'MCP Gateway', url: `${host}:8317`, color: 'var(--corn-teal)' },
+            { name: 'Qdrant', url: `${host}:6333`, color: 'var(--corn-gold)' },
           ].map(s => (
             <div key={s.name} style={{ padding: 'var(--space-3)', background: 'rgba(255,255,255,0.03)', borderRadius: 'var(--radius-md)', border: '1px solid rgba(255,255,255,0.06)', minWidth: 120, textAlign: 'center' }}>
               <div style={{ fontWeight: 600, fontSize: '0.85rem' }}>{s.name}</div>
-              <div style={{ color: s.color, fontWeight: 700, fontSize: '1.1rem', fontFamily: 'monospace' }}>{s.port}</div>
+              <div style={{ color: s.color, fontWeight: 700, fontSize: '0.9rem', fontFamily: 'monospace' }}>{s.url}</div>
             </div>
           ))}
         </div>
@@ -135,9 +161,14 @@ pnpm build`}</code>
                 ['OPENAI_API_KEY', '—', 'Voyage AI / OpenAI API key for embeddings'],
                 ['OPENAI_API_BASE', 'https://api.voyageai.com/v1', 'Embedding API base URL'],
                 ['MEM9_EMBEDDING_MODEL', 'voyage-code-3', 'Primary embedding model'],
+                ['MEM9_EMBEDDING_DIMS', '1024', 'Embedding vector dimensions'],
                 ['MEM9_FALLBACK_MODELS', 'voyage-4-large,...', 'Fallback model rotation chain'],
-                ['DASHBOARD_API_URL', 'http://localhost:4000', 'Dashboard API URL'],
-                ['QDRANT_URL', 'http://localhost:6333', 'Vector database URL'],
+                ['DASHBOARD_API_URL', apiUrl || 'http://localhost:4000', 'Dashboard API URL'],
+                ['DASHBOARD_API_KEY', '—', 'API key for MCP → API communication'],
+                ['AUTH_JWT_SECRET', 'changeme', 'JWT secret for user authentication'],
+                ['CORS_ORIGIN', 'http://localhost:3000', 'Allowed CORS origin for dashboard'],
+                ['GEMINI_API_KEY', '—', 'Google Gemini API key (optional)'],
+                ['QDRANT_URL', `http://${host || 'localhost'}:6333`, 'Vector database URL'],
               ].map(([name, def, desc]) => (
                 <tr key={name}>
                   <td><code style={{ color: 'var(--corn-gold)', fontSize: '0.82rem', background: 'rgba(251,191,36,0.1)', padding: '2px 6px', borderRadius: 4 }}>{name}</code></td>

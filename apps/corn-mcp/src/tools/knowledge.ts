@@ -5,6 +5,12 @@ import { LocalMem9Service, OpenAIEmbeddingProvider, LocalHashEmbeddingProvider }
 import type { EmbeddingProvider } from '@corn/shared-mem9'
 import { generateId } from '@corn/shared-utils'
 
+function apiHeaders(env: McpEnv): Record<string, string> {
+  const h: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (env.DASHBOARD_API_KEY) h['X-API-Key'] = env.DASHBOARD_API_KEY
+  return h
+}
+
 let mem9: LocalMem9Service | null = null
 
 async function createEmbedder(): Promise<EmbeddingProvider> {
@@ -75,7 +81,7 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
         const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
         await fetch(`${apiUrl}/api/knowledge`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: apiHeaders(env),
           body: JSON.stringify({
             id,
             title,

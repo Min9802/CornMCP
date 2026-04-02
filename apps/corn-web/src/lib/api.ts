@@ -3,6 +3,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     ...options,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...options?.headers,
@@ -100,6 +101,21 @@ export const deleteApiKey = (id: string) =>
 export const getOrganizations = () =>
   apiFetch<{ organizations: any[] }>('/api/orgs')
 
+export const createOrganization = (data: { name: string; description?: string }) =>
+  apiFetch<{ ok: boolean; id: string }>('/api/orgs', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+
+export const updateOrganization = (id: string, data: { name: string; description?: string }) =>
+  apiFetch<{ ok: boolean }>(`/api/orgs/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+
+export const deleteOrganization = (id: string) =>
+  apiFetch<{ ok: boolean }>(`/api/orgs/${id}`, { method: 'DELETE' })
+
 // ─── Providers ──────────────────────────────────────────
 export const getProviders = () => apiFetch<{ providers: any[] }>('/api/providers')
 
@@ -111,6 +127,12 @@ export const createProvider = (data: { name: string; type: string; apiBase: stri
 
 export const deleteProvider = (id: string) =>
   apiFetch<{ ok: boolean }>(`/api/providers/${id}`, { method: 'DELETE' })
+
+export const updateProvider = (id: string, data: { name?: string; apiBase?: string; apiKey?: string; models?: string[]; status?: string }) =>
+  apiFetch<{ ok: boolean }>(`/api/providers/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  })
 
 // ─── Usage ──────────────────────────────────────────────
 export const getUsageStats = (days = 30) =>
@@ -152,4 +174,31 @@ export interface ToolAnalytics {
 
 export const getToolAnalytics = (days = 30) =>
   apiFetch<ToolAnalytics>(`/api/analytics/tool-analytics?days=${days}`)
+
+// ─── Users (admin only) ──────────────────────────────────
+export interface UserRecord {
+  id: string
+  email: string
+  name: string
+  role: 'admin' | 'user'
+  is_active: number
+  created_at: string
+}
+
+export const getUsers = () => apiFetch<{ users: UserRecord[] }>('/api/users')
+
+export const createUser = (data: { email: string; password: string; name: string; role?: string }) =>
+  apiFetch<{ ok: boolean; id: string }>('/api/users', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+
+export const updateUser = (id: string, data: { name?: string; role?: string; isActive?: boolean; password?: string }) =>
+  apiFetch<{ ok: boolean }>(`/api/users/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+
+export const deleteUser = (id: string) =>
+  apiFetch<{ ok: boolean }>(`/api/users/${id}`, { method: 'DELETE' })
 

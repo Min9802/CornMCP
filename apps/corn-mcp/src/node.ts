@@ -34,9 +34,9 @@ import app from './index.js'
 
 const port = Number(process.env.PORT) || 8317
 
-serve({ fetch: app.fetch, port }, () => {
-  console.log(`🌽 Corn MCP Server listening on http://localhost:${port}`)
-  console.log(`   Health: http://localhost:${port}/health`)
-  console.log(`   MCP:    http://localhost:${port}/mcp`)
+serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, () => {
+  console.log(`🌽 Corn MCP Server listening on http://0.0.0.0:${port}`)
+  console.log(`   Health: http://0.0.0.0:${port}/health`)
+  console.log(`   MCP:    http://0.0.0.0:${port}/mcp`)
   console.log(`   Embedding: ${process.env['OPENAI_API_BASE'] || 'https://api.voyageai.com/v1'} (${process.env['MEM9_EMBEDDING_MODEL'] || 'voyage-code-3'})`)
 })
