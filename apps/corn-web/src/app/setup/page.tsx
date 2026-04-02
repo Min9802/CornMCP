@@ -1,19 +1,22 @@
 'use client'
 import DashboardLayout from "@/components/layout/DashboardLayout"
 
+const _apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'
+const _mcpUrl = process.env.NEXT_PUBLIC_MCP_URL || 'http://localhost:8317'
+
 function useServiceUrls() {
-  if (typeof window === 'undefined') return { host: 'localhost', apiUrl: '', mcpUrl: '', webUrl: '' }
-  const host = window.location.hostname
+  if (typeof window === 'undefined') return { host: 'localhost', apiUrl: _apiUrl, mcpUrl: _mcpUrl, webUrl: '' }
+  const webUrl = `${window.location.protocol}//${window.location.host}`
   return {
-    host,
-    apiUrl: `http://${host}:4000`,
-    mcpUrl: `http://${host}:8317`,
-    webUrl: `http://${host}:3000`,
+    host: new URL(_apiUrl).hostname,
+    apiUrl: _apiUrl,
+    mcpUrl: _mcpUrl,
+    webUrl,
   }
 }
 
 export default function SetupPage() {
-  const { host, apiUrl, mcpUrl } = useServiceUrls()
+  const { host, apiUrl, mcpUrl, webUrl } = useServiceUrls()
   return (
     <DashboardLayout title="Installation" subtitle="Get Corn Hub running in your IDE in under 2 minutes">
 
@@ -133,10 +136,10 @@ pnpm build`}</code>
         </pre>
         <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
           {[
-            { name: 'Dashboard', url: `${host}:3000`, color: 'var(--corn-blue)' },
-            { name: 'API', url: `${host}:4000`, color: 'var(--corn-green)' },
-            { name: 'MCP Gateway', url: `${host}:8317`, color: 'var(--corn-teal)' },
-            { name: 'Qdrant', url: `${host}:6333`, color: 'var(--corn-gold)' },
+            { name: 'Dashboard', url: webUrl || apiUrl, color: 'var(--corn-blue)' },
+            { name: 'API', url: apiUrl, color: 'var(--corn-green)' },
+            { name: 'MCP Gateway', url: mcpUrl, color: 'var(--corn-teal)' },
+            { name: 'Qdrant', url: `http://${host}:6333`, color: 'var(--corn-gold)' },
           ].map(s => (
             <div key={s.name} style={{ padding: 'var(--space-3)', background: 'rgba(255,255,255,0.03)', borderRadius: 'var(--radius-md)', border: '1px solid rgba(255,255,255,0.06)', minWidth: 120, textAlign: 'center' }}>
               <div style={{ fontWeight: 600, fontSize: '0.85rem' }}>{s.name}</div>
@@ -168,7 +171,7 @@ pnpm build`}</code>
                 ['AUTH_JWT_SECRET', 'changeme', 'JWT secret for user authentication'],
                 ['CORS_ORIGIN', 'http://localhost:3000', 'Allowed CORS origin for dashboard'],
                 ['GEMINI_API_KEY', '—', 'Google Gemini API key (optional)'],
-                ['QDRANT_URL', `http://${host || 'localhost'}:6333`, 'Vector database URL'],
+                ['QDRANT_URL', 'http://<host>:6333', 'Vector database URL'],
               ].map(([name, def, desc]) => (
                 <tr key={name}>
                   <td><code style={{ color: 'var(--corn-gold)', fontSize: '0.82rem', background: 'rgba(251,191,36,0.1)', padding: '2px 6px', borderRadius: 4 }}>{name}</code></td>

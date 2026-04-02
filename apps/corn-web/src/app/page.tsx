@@ -6,6 +6,8 @@ import useSWR from 'swr'
 import { checkHealth, getDashboardOverview, getActivityFeed, type ActivityEvent } from '@/lib/api'
 import styles from './page.module.css'
 
+const MCP_URL = process.env.NEXT_PUBLIC_MCP_URL || 'http://localhost:8317'
+
 function formatNumber(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
@@ -211,7 +213,7 @@ export default function DashboardPage() {
 {`{
   "mcpServers": {
     "corn-hub": {
-      "url": "http://localhost:8317/mcp",
+      "url": "${MCP_URL}/mcp",
       "headers": {
         "Authorization": "Bearer <your-api-key>"
       }

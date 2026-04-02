@@ -4,12 +4,9 @@ import useSWR from 'swr'
 import { checkHealth } from '@/lib/api'
 
 function useServiceUrls() {
-  if (typeof window === 'undefined') return { apiUrl: '', mcpUrl: '' }
-  const host = window.location.hostname
-  return {
-    apiUrl: `http://${host}:4000`,
-    mcpUrl: `http://${host}:8317`,
-  }
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'
+  const mcpUrl = process.env.NEXT_PUBLIC_MCP_URL || 'http://localhost:8317'
+  return { apiUrl, mcpUrl }
 }
 
 export default function SettingsPage() {

@@ -45,7 +45,7 @@ services:
     container_name: corn-api
     restart: unless-stopped
     ports:
-      - "4000:4000"
+      - "${API_PORT:-6100}:4000"
     volumes:
       - api-data:/app/data
     environment:
@@ -69,6 +69,9 @@ services:
       MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Corn Hub}
       # Using Voyage AI by default for code embeddings
       MEM9_EMBEDDING_MODEL: ${MEM9_EMBEDDING_MODEL:-voyage-code-3}
+      # Google OAuth
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
     depends_on:
       qdrant:
         condition: service_healthy
@@ -94,7 +97,7 @@ services:
     container_name: corn-mcp
     restart: unless-stopped
     ports:
-      - "8317:8317"
+      - "${MCP_PORT:-8317}:8317"
     environment:
       PORT: 8317
       NODE_ENV: production
@@ -132,11 +135,12 @@ services:
       dockerfile: infra/Dockerfile.corn-web
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+        NEXT_PUBLIC_MCP_URL: ${NEXT_PUBLIC_MCP_URL:-http://localhost:8317}
     image: corn-web:latest
     container_name: corn-web
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${WEB_PORT:-3000}:3000"
     depends_on:
       corn-api:
         condition: service_healthy

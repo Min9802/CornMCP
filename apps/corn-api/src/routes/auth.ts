@@ -225,3 +225,141 @@ authRouter.post('/validate-key', async (c) => {
     userRole: keyRow['role'],
   })
 })
+
+// ─── Google OAuth ─────────────────────────────────────────
+const GOOGLE_CLIENT_ID = process.env['GOOGLE_CLIENT_ID'] || ''
+const GOOGLE_CLIENT_SECRET = process.env['GOOGLE_CLIENT_SECRET'] || ''
+
+function getGoogleRedirectUri(c: { req: { url: string } }): string {
+  const url = new URL(c.req.url)
+  return `${url.protocol}//${url.host}/api/auth/google/callback`
+}
+
+// Step 1: Redirect to Google consent screen
+authRouter.get('/google', (c) => {
+  if (!GOOGLE_CLIENT_ID) return c.json({ error: 'Google OAuth not configured' }, 503)
+
+  const redirectUri = getGoogleRedirectUri(c)
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: 'openid email profile',
+    access_type: 'online',
+    prompt: 'select_account',
+  })
+
+  return c.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`)
+})
+
+// Step 2: Google callback — exchange code → token → user info → login/register
+authRouter.get('/google/callback', async (c) => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    return c.redirect('/login?error=google_not_configured')
+  }
+
+  const code = c.req.query('code')
+  const error = c.req.query('error')
+
+  if (error || !code) {
+    return c.redirect(`/login?error=${encodeURIComponent(error || 'google_cancelled')}`)
+  }
+
+  const redirectUri = getGoogleRedirectUri(c)
+  const webOrigin = process.env['CORS_ORIGIN'] || 'http://localhost:3000'
+
+  try {
+    // Exchange code for tokens
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code',
+      }).toString(),
+    })
+
+    if (!tokenRes.ok) {
+      return c.redirect(`${webOrigin}/login?error=google_token_failed`)
+    }
+
+    const tokenData = await tokenRes.json() as { access_token: string }
+    const accessToken = tokenData.access_token
+
+    // Get user info from Google
+    const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+
+    if (!userInfoRes.ok) {
+      return c.redirect(`${webOrigin}/login?error=google_userinfo_failed`)
+    }
+
+    const googleUser = await userInfoRes.json() as {
+      id: string
+      email: string
+      name: string
+      picture?: string
+      verified_email: boolean
+    }
+
+    if (!googleUser.email || !googleUser.verified_email) {
+      return c.redirect(`${webOrigin}/login?error=google_email_unverified`)
+    }
+
+    const email = googleUser.email.toLowerCase()
+
+    // Find existing user by google_id or email
+    let user = await dbGet(
+      'SELECT id, email, name, role, is_active, google_id FROM users WHERE google_id = ? OR email = ?',
+      [googleUser.id, email],
+    )
+
+    if (user) {
+      // Existing user — update google_id/avatar if not set
+      if (!user['is_active']) {
+        return c.redirect(`${webOrigin}/login?error=account_disabled`)
+      }
+      await dbRun(
+        `UPDATE users SET google_id = ?, avatar_url = ?, email_verified = 1, updated_at = datetime('now') WHERE id = ?`,
+        [googleUser.id, googleUser.picture || null, user['id']],
+      )
+    } else {
+      // New user via Google — always 'user' role
+      const userCount = await dbGet('SELECT COUNT(*) as count FROM users')
+      // Only auto-admin if truly the first user ever
+      const isFirst = Number(userCount?.['count'] ?? 0) === 0
+      const id = generateId('usr')
+      await dbRun(
+        `INSERT INTO users (id, email, password_hash, name, role, is_active, email_verified, google_id, avatar_url)
+         VALUES (?, ?, NULL, ?, ?, 1, 1, ?, ?)`,
+        [id, email, googleUser.name, isFirst ? 'admin' : 'user', googleUser.id, googleUser.picture || null],
+      )
+      user = await dbGet('SELECT id, email, name, role FROM users WHERE id = ?', [id])
+    }
+
+    const authUser: AuthUser = {
+      id: user!['id'] as string,
+      email: user!['email'] as string,
+      name: user!['name'] as string,
+      role: user!['role'] as 'admin' | 'user',
+    }
+
+    const token = await signJwt(authUser)
+    setCookie(c, 'corn_token', token, {
+      httpOnly: true,
+      secure: process.env['NODE_ENV'] === 'production',
+      sameSite: 'Lax',
+      maxAge: 60 * 60 * 24 * 7,
+      path: '/',
+    })
+
+    return c.redirect(webOrigin)
+  } catch (err) {
+    console.error('[Google OAuth] error:', err)
+    return c.redirect(`${webOrigin}/login?error=google_internal_error`)
+  }
+})
