@@ -1,5 +1,5 @@
 import initSqlJs, { type Database, type SqlValue } from 'sql.js'
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createLogger } from '@corn/shared-utils'
@@ -30,29 +30,66 @@ export async function getDb(): Promise<Database> {
     db = new SQL.Database()
   }
 
-  // Run schema
+  const __dir = dirname(fileURLToPath(import.meta.url))
+
   try {
-    const __dirname = dirname(fileURLToPath(import.meta.url))
-    const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf-8')
+    // 1. Run base schema (CREATE TABLE IF NOT EXISTS — always idempotent)
+    const schema = readFileSync(join(__dir, 'schema.sql'), 'utf-8')
     db.run(schema)
 
-    // Run migrations (idempotent — ignore if column already exists)
-    const migrations = [
-      `ALTER TABLE api_keys ADD COLUMN user_id TEXT`,
-      `ALTER TABLE provider_accounts ADD COLUMN user_id TEXT`,
-      `ALTER TABLE organizations ADD COLUMN user_id TEXT`,
-      `ALTER TABLE knowledge_documents ADD COLUMN user_id TEXT`,
-      `ALTER TABLE quality_reports ADD COLUMN user_id TEXT`,
-      `ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`,
-    ]
-    for (const migration of migrations) {
-      try { db.run(migration) } catch { /* column already exists */ }
+    // 2. Ensure migrations tracking table exists
+    db.run(`CREATE TABLE IF NOT EXISTS schema_migrations (
+      name TEXT PRIMARY KEY,
+      applied_at TEXT DEFAULT (datetime('now'))
+    )`)
+
+    // 3. Load applied migrations
+    const applied = new Set<string>(
+      (db.exec('SELECT name FROM schema_migrations')[0]?.values ?? [])
+        .map((r) => r[0] as string),
+    )
+
+    // 4. Load & run pending migration files in order
+    const migrationsDir = join(__dir, 'migrations')
+    if (existsSync(migrationsDir)) {
+      const files = readdirSync(migrationsDir)
+        .filter((f) => f.endsWith('.sql'))
+        .sort() // lexicographic order → 0001, 0002, ...
+
+      for (const file of files) {
+        if (applied.has(file)) continue
+        const sql = readFileSync(join(migrationsDir, file), 'utf-8')
+        try {
+          // Split by ';' to handle multi-statement migrations
+          const statements = sql.split(';').map((s) => s.trim()).filter(Boolean)
+          for (const stmt of statements) {
+            db.run(stmt)
+          }
+          db.run('INSERT INTO schema_migrations (name) VALUES (?)', [file])
+          logger.info(`Migration applied: ${file}`)
+        } catch (err) {
+          // Some migrations are idempotent (e.g. ADD COLUMN on existing DB)
+          // Only skip "already exists" type errors
+          const msg = (err as Error).message || ''
+          if (
+            msg.includes('duplicate column') ||
+            msg.includes('already exists') ||
+            msg.includes('no such table')
+          ) {
+            // Mark as applied so we don't retry
+            try { db.run('INSERT INTO schema_migrations (name) VALUES (?)', [file]) } catch { /* already marked */ }
+            logger.info(`Migration skipped (already applied): ${file}`)
+          } else {
+            logger.error(`Migration failed: ${file} — ${msg}`)
+          }
+        }
+      }
     }
 
     saveDb()
     logger.info(`Database initialized at ${dbPath}`)
   } catch (err) {
-    logger.error('Failed to initialize schema:', err)
+    logger.error('Failed to initialize database:', err)
     throw err
   }
 

@@ -230,9 +230,12 @@ authRouter.post('/validate-key', async (c) => {
 const GOOGLE_CLIENT_ID = process.env['GOOGLE_CLIENT_ID'] || ''
 const GOOGLE_CLIENT_SECRET = process.env['GOOGLE_CLIENT_SECRET'] || ''
 
-function getGoogleRedirectUri(c: { req: { url: string } }): string {
+function getGoogleRedirectUri(c: { req: { url: string; header: (name: string) => string | undefined } }): string {
   const url = new URL(c.req.url)
-  return `${url.protocol}//${url.host}/api/auth/google/callback`
+  // Behind nginx reverse proxy, use X-Forwarded-Proto to get the real scheme
+  const proto = c.req.header('x-forwarded-proto') || url.protocol.replace(':', '')
+  const host = c.req.header('x-forwarded-host') || url.host
+  return `${proto}://${host}/api/auth/google/callback`
 }
 
 // Step 1: Redirect to Google consent screen
@@ -317,6 +320,7 @@ authRouter.get('/google/callback', async (c) => {
       'SELECT id, email, name, role, is_active, google_id FROM users WHERE google_id = ? OR email = ?',
       [googleUser.id, email],
     )
+    let isNewUser = false
 
     if (user) {
       // Existing user — update google_id/avatar if not set
@@ -329,6 +333,7 @@ authRouter.get('/google/callback', async (c) => {
       )
     } else {
       // New user via Google — always 'user' role
+      isNewUser = true
       const userCount = await dbGet('SELECT COUNT(*) as count FROM users')
       // Only auto-admin if truly the first user ever
       const isFirst = Number(userCount?.['count'] ?? 0) === 0
@@ -357,9 +362,34 @@ authRouter.get('/google/callback', async (c) => {
       path: '/',
     })
 
-    return c.redirect(webOrigin)
+    // Redirect new Google users to set-password page
+    const redirectTo = isNewUser ? `${webOrigin}/set-password?new_google=1` : webOrigin
+    return c.redirect(redirectTo)
   } catch (err) {
     console.error('[Google OAuth] error:', err)
     return c.redirect(`${webOrigin}/login?error=google_internal_error`)
   }
+})
+
+// ─── Set Password (for Google OAuth users) ───────────────
+authRouter.post('/set-password', async (c) => {
+  const token = getCookie(c, 'corn_token')
+  if (!token) return c.json({ error: 'Not authenticated' }, 401)
+  const me = await verifyJwt(token)
+  if (!me) return c.json({ error: 'Invalid session' }, 401)
+
+  const body = await c.req.json()
+  const { password } = body
+
+  if (!password || password.length < 8) {
+    return c.json({ error: 'Password must be at least 8 characters' }, 400)
+  }
+
+  const passwordHash = await bcrypt.hash(password, 12)
+  await dbRun(
+    `UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?`,
+    [passwordHash, me.id],
+  )
+
+  return c.json({ ok: true })
 })
