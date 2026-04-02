@@ -56,6 +56,8 @@ services:
       MCP_URL: http://corn-mcp:8317
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-changeme}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
       # Using Voyage AI by default for code embeddings
       MEM9_EMBEDDING_MODEL: ${MEM9_EMBEDDING_MODEL:-voyage-code-3}
     depends_on:
@@ -88,10 +90,14 @@ services:
       PORT: 8317
       NODE_ENV: production
       DASHBOARD_API_URL: http://corn-api:4000
+      DASHBOARD_API_KEY: ${DASHBOARD_API_KEY:-}
       QDRANT_URL: http://qdrant:6333
       MCP_SERVER_NAME: "corn-hub"
       MCP_SERVER_VERSION: "0.1.0"
-      API_KEYS: ${MCP_API_KEYS:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.voyageai.com/v1}
+      MEM9_EMBEDDING_MODEL: ${MEM9_EMBEDDING_MODEL:-voyage-code-3}
+      MEM9_EMBEDDING_DIMS: ${MEM9_EMBEDDING_DIMS:-1024}
     depends_on:
       corn-api:
         condition: service_healthy
@@ -115,6 +121,8 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfile.corn-web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
     image: corn-web:latest
     container_name: corn-web
     restart: unless-stopped
@@ -146,7 +154,7 @@ services:
       WATCHTOWER_CLEANUP: "true"
       WATCHTOWER_POLL_INTERVAL: 300
       WATCHTOWER_LABEL_ENABLE: "false"
-      DOCKER_API_VERSION: "1.43"
+      DOCKER_API_VERSION: "1.44"
     deploy:
       resources:
         limits:

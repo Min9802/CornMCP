@@ -14,12 +14,15 @@
     "@corn/shared-types": "workspace:*",
     "@corn/shared-utils": "workspace:*",
     "@hono/node-server": "^1.14.0",
+    "bcryptjs": "^2.4.3",
     "hono": "^4.7.0",
-    "sql.js": "^1.12.0"
+    "jose": "^5.9.6",
+    "sql.js": "^1.12.0",
+    "typescript": "^5.7.0"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "@types/sql.js": "^1.4.10",
-    "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "tsx": "^4.19.0"
   }
 }
