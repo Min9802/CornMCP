@@ -35,22 +35,31 @@ importers:
       '@hono/node-server':
         specifier: ^1.14.0
         version: 1.19.11(hono@4.12.9)
+      bcryptjs:
+        specifier: ^2.4.3
+        version: 2.4.3
       hono:
         specifier: ^4.7.0
         version: 4.12.9
+      jose:
+        specifier: ^5.9.6
+        version: 5.10.0
       sql.js:
         specifier: ^1.12.0
         version: 1.14.1
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
     devDependencies:
+      '@types/bcryptjs':
+        specifier: ^2.4.6
+        version: 2.4.6
       '@types/sql.js':
         specifier: ^1.4.10
         version: 1.4.10
       tsx:
         specifier: ^4.19.0
         version: 4.21.0
-      typescript:
-        specifier: ^5.7.0
-        version: 5.9.3
 
   apps/corn-mcp:
     dependencies:
@@ -557,6 +566,9 @@ packages:
     cpu: [arm64]
     os: [win32]
 
+  '@types/bcryptjs@2.4.6':
+    resolution: {integrity: sha512-9xlo6R2qDs5uixm0bcIqCeMCE6HiQsIyel9KQySStiyqNl2tnj2mP3DX1Nf56MD6KMenNNlBBsy3LJ7gUEQPXQ==}
+
   '@types/emscripten@1.41.5':
     resolution: {integrity: sha512-cMQm7pxu6BxtHyqJ7mQZ2kXWV5SLmugybFdHCBbJ5eHzOo6VhBckEgAT3//rP5FwPHNPeEiq4SmQ5ucBwsOo4Q==}
 
@@ -593,6 +605,9 @@ packages:
     resolution: {integrity: sha512-sUoJ3IMxx4AyRqO4MLeHlnGDkyXRoUG0/AI9fjK+vS72ekpV0yWVY7O0BVjmBcRtkNcsAO2QDZ4tdKKGoI6YaQ==}
     engines: {node: '>=6.0.0'}
     hasBin: true
+
+  bcryptjs@2.4.3:
+    resolution: {integrity: sha512-V/Hy/X9Vt7f3BbPJEi8BdVFMByHi+jNXrYkW3huaybV/kQ0KJg0Y6PkEMbn+zeT+i+SiKZ/HMqJGIIt4LZDqNQ==}
 
   body-parser@2.2.2:
     resolution: {integrity: sha512-oP5VkATKlNwcgvxi0vM0p/D3n2C3EReYVX+DNYs5TjZFn/oQt2j+4sVJtSMr18pdRr8wjTcBl6LoV+FUwzPmNA==}
@@ -794,6 +809,9 @@ packages:
 
   isexe@2.0.0:
     resolution: {integrity: sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw==}
+
+  jose@5.10.0:
+    resolution: {integrity: sha512-s+3Al/p9g32Iq+oqXxkW//7jk2Vig6FF1CFqzVXoTUXt2qz89YWbL+OwS17NFYEvxC35n0FKeGO2LGYSxeM2Gg==}
 
   jose@6.2.2:
     resolution: {integrity: sha512-d7kPDd34KO/YnzaDOlikGpOurfF0ByC2sEV4cANCtdqLlTfBlw2p14O/5d/zv40gJPbIQxfES3nSx1/oYNyuZQ==}
@@ -1327,6 +1345,8 @@ snapshots:
   '@turbo/windows-arm64@2.8.20':
     optional: true
 
+  '@types/bcryptjs@2.4.6': {}
+
   '@types/emscripten@1.41.5': {}
 
   '@types/node@22.19.15':
@@ -1363,6 +1383,8 @@ snapshots:
       require-from-string: 2.0.2
 
   baseline-browser-mapping@2.10.10: {}
+
+  bcryptjs@2.4.3: {}
 
   body-parser@2.2.2:
     dependencies:
@@ -1598,6 +1620,8 @@ snapshots:
   is-promise@4.0.0: {}
 
   isexe@2.0.0: {}
+
+  jose@5.10.0: {}
 
   jose@6.2.2: {}
 

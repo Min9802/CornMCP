@@ -8,6 +8,11 @@ import type { McpEnv } from '@corn/shared-types'
  */
 export function registerAnalyticsTools(server: McpServer, env: McpEnv) {
   const apiUrl = () => (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
+  const apiHeaders = () => {
+    const h: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (env.DASHBOARD_API_KEY) h['X-API-Key'] = env.DASHBOARD_API_KEY
+    return h
+  }
 
   server.tool(
     'corn_tool_stats',
@@ -26,7 +31,7 @@ export function registerAnalyticsTools(server: McpServer, env: McpEnv) {
 
         const res = await fetch(
           `${apiUrl()}/api/analytics/tool-analytics?${params.toString()}`,
-          { signal: AbortSignal.timeout(10000) },
+          { headers: apiHeaders(), signal: AbortSignal.timeout(10000) },
         )
 
         if (!res.ok) {

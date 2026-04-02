@@ -35,6 +35,19 @@ export async function getDb(): Promise<Database> {
     const __dirname = dirname(fileURLToPath(import.meta.url))
     const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf-8')
     db.run(schema)
+
+    // Run migrations (idempotent — ignore if column already exists)
+    const migrations = [
+      `ALTER TABLE api_keys ADD COLUMN user_id TEXT`,
+      `ALTER TABLE provider_accounts ADD COLUMN user_id TEXT`,
+      `ALTER TABLE organizations ADD COLUMN user_id TEXT`,
+      `ALTER TABLE knowledge_documents ADD COLUMN user_id TEXT`,
+      `ALTER TABLE quality_reports ADD COLUMN user_id TEXT`,
+    ]
+    for (const migration of migrations) {
+      try { db.run(migration) } catch { /* column already exists */ }
+    }
+
     saveDb()
     logger.info(`Database initialized at ${dbPath}`)
   } catch (err) {

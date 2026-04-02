@@ -22,6 +22,7 @@ app.use('*', async (c, next) => {
   const envKeys: (keyof Env)[] = [
     'QDRANT_URL',
     'DASHBOARD_API_URL',
+    'DASHBOARD_API_KEY',
     'MCP_SERVER_NAME',
     'MCP_SERVER_VERSION',
     'API_KEYS',
@@ -60,31 +61,82 @@ app.get('/health', (c) => {
   })
 })
 
-// ─── OAuth Discovery Stubs ────────────────────────────────
-// Required for mcp-remote compatibility
+// ─── OAuth Discovery ──────────────────────────────────
+// VS Code Copilot probes these endpoints before connecting.
+// We tell it: "use Bearer token in header, no OAuth flow needed."
+const getBaseUrl = (reqUrl: string, path: string) => {
+  const u = new URL(reqUrl)
+  return `${u.protocol}//${u.host}${path}`
+}
+
 app.get('/.well-known/oauth-protected-resource/mcp', (c) => {
   return c.json({
-    resource: `${c.req.url.replace('/.well-known/oauth-protected-resource/mcp', '/mcp')}`,
+    resource: getBaseUrl(c.req.url, '/mcp'),
     bearer_methods_supported: ['header'],
   })
 })
 
 app.get('/.well-known/oauth-protected-resource', (c) => {
   return c.json({
-    resource: c.req.url.replace('/.well-known/oauth-protected-resource', '/'),
+    resource: getBaseUrl(c.req.url, '/'),
     bearer_methods_supported: ['header'],
   })
 })
 
-app.get('/.well-known/oauth-authorization-server', (c) =>
-  c.json({ error: 'OAuth not supported. Use Bearer token.' }, 404),
-)
-app.get('/.well-known/openid-configuration', (c) =>
-  c.json({ error: 'OAuth not supported. Use Bearer token.' }, 404),
-)
-app.post('/register', (c) =>
-  c.json({ error: 'Dynamic client registration not supported.' }, 404),
-)
+// Return a minimal authorization server metadata so VS Code doesn't
+// trigger the "Dynamic Client Registration not supported" dialog.
+app.get('/.well-known/oauth-authorization-server', (c) => {
+  const base = getBaseUrl(c.req.url, '')
+  return c.json({
+    issuer: base,
+    authorization_endpoint: `${base}/oauth/authorize`,
+    token_endpoint: `${base}/oauth/token`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code'],
+    code_challenge_methods_supported: ['S256'],
+    registration_endpoint: `${base}/register`,
+  })
+})
+
+app.get('/.well-known/openid-configuration', (c) => {
+  const base = getBaseUrl(c.req.url, '')
+  return c.json({
+    issuer: base,
+    authorization_endpoint: `${base}/oauth/authorize`,
+    token_endpoint: `${base}/oauth/token`,
+  })
+})
+
+// Dynamic client registration — accept any request, return a fake client_id
+app.post('/register', async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  return c.json({
+    client_id: 'corn-mcp-client',
+    client_secret: '',
+    client_name: (body as any).client_name || 'VS Code',
+    redirect_uris: (body as any).redirect_uris || [],
+  })
+})
+
+// OAuth authorize — redirect back with the Bearer token as code
+app.get('/oauth/authorize', (c) => {
+  const redirectUri = c.req.query('redirect_uri')
+  const state = c.req.query('state')
+  if (!redirectUri) return c.text('Missing redirect_uri', 400)
+  const url = new URL(redirectUri)
+  url.searchParams.set('code', 'corn-auth-code')
+  if (state) url.searchParams.set('state', state)
+  return c.redirect(url.toString())
+})
+
+// OAuth token — exchange code for the API key (from Authorization header)
+app.post('/oauth/token', async (c) => {
+  return c.json({
+    access_token: 'provide-your-api-key',
+    token_type: 'Bearer',
+    expires_in: 3600 * 24 * 365,
+  })
+})
 
 // Root — server info
 app.get('/', (c) => {
@@ -137,6 +189,13 @@ export function createMcpServer(env: Env) {
 app.all('/mcp', async (c) => {
   const envWithOwner = { ...c.env } as Env & { API_KEY_OWNER?: string }
 
+  // Extract raw API key for forwarding to corn-api
+  const authHeader = c.req.header('authorization')
+  const xApiKey = c.req.header('x-api-key')
+  let rawApiKey: string | undefined
+  if (authHeader?.startsWith('Bearer ')) rawApiKey = authHeader.slice(7).trim()
+  else if (xApiKey) rawApiKey = xApiKey.trim()
+
   // Auth
   try {
     const authResult = await validateApiKey(c.req.raw, c.env)
@@ -155,6 +214,10 @@ app.all('/mcp', async (c) => {
     }
     if (authResult.agentId) {
       envWithOwner.API_KEY_OWNER = authResult.agentId
+    }
+    // Forward the raw API key so tools can authenticate with corn-api
+    if (rawApiKey) {
+      envWithOwner.DASHBOARD_API_KEY = rawApiKey
     }
   } catch (err) {
     return c.json(
@@ -208,9 +271,11 @@ app.all('/mcp', async (c) => {
     // Log to Dashboard API (best effort)
     if (toolName !== 'unknown') {
       const apiUrl = (c.env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
+      const telemetryHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (c.env.DASHBOARD_API_KEY) telemetryHeaders['X-API-Key'] = c.env.DASHBOARD_API_KEY
       fetch(`${apiUrl}/api/metrics/query-log`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: telemetryHeaders,
         body: JSON.stringify({
           agentId: envWithOwner.API_KEY_OWNER || 'unknown',
           tool: toolName,

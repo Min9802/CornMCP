@@ -1,24 +1,26 @@
-import { createLogger, hashApiKey } from '@corn/shared-utils'
+import { createLogger } from '@corn/shared-utils'
 
 const logger = createLogger('mcp-auth')
 
 interface AuthResult {
   valid: boolean
   agentId?: string
+  keyId?: string
+  userId?: string
   error?: string
 }
 
 /**
- * Validate API key from Authorization header or X-API-Key header.
- * Supports both:
+ * Validate API key by calling corn-api's /api/auth/validate-key endpoint.
+ * This looks up the key in the database (per-user keys) instead of env.
+ *
+ * Supports:
  *   - Bearer <key> (standard MCP auth)
  *   - X-API-Key: <key> (legacy)
- *
- * API_KEYS env format: "key1:agent1,key2:agent2"
  */
 export async function validateApiKey(
   request: Request,
-  env: { API_KEYS: string },
+  env: { API_KEYS: string; DASHBOARD_API_URL?: string },
 ): Promise<AuthResult> {
   // Extract key from headers
   const authHeader = request.headers.get('authorization')
@@ -35,24 +37,31 @@ export async function validateApiKey(
     return { valid: false, error: 'No API key provided' }
   }
 
-  // Parse API_KEYS: "key1:agent1,key2:agent2"
-  const apiKeysStr = env.API_KEYS || ''
-  if (!apiKeysStr) {
-    // If no keys configured, allow all (dev mode)
-    logger.warn('No API_KEYS configured — allowing all requests (dev mode)')
-    return { valid: true, agentId: 'dev' }
+  const apiUrl = (env.DASHBOARD_API_URL || process.env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
+
+  try {
+    const res = await fetch(`${apiUrl}/api/auth/validate-key`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+      signal: AbortSignal.timeout(5000),
+    })
+
+    const data = await res.json() as Record<string, unknown>
+
+    if (!data.valid) {
+      logger.warn('Invalid API key attempted')
+      return { valid: false, error: (data.error as string) || 'Invalid API key' }
+    }
+
+    return {
+      valid: true,
+      agentId: (data.keyName as string) || 'unknown',
+      keyId: data.keyId as string,
+      userId: data.userId as string,
+    }
+  } catch (err) {
+    logger.error('Failed to validate API key via Dashboard API:', err)
+    return { valid: false, error: 'API key validation service unavailable' }
   }
-
-  const keyPairs = apiKeysStr.split(',').map((pair) => {
-    const [k, agent] = pair.split(':')
-    return { key: k.trim(), agentId: agent?.trim() || 'unknown' }
-  })
-
-  const match = keyPairs.find((kp) => kp.key === key)
-  if (match) {
-    return { valid: true, agentId: match.agentId }
-  }
-
-  logger.warn('Invalid API key attempted')
-  return { valid: false, error: 'Invalid API key' }
 }

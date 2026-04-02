@@ -71,6 +71,7 @@ async function run() {
   interface Env {
     QDRANT_URL: string
     DASHBOARD_API_URL: string
+    DASHBOARD_API_KEY?: string
     MCP_SERVER_NAME: string
     MCP_SERVER_VERSION: string
     API_KEYS: string
@@ -80,6 +81,7 @@ async function run() {
   const env: Env = {
     QDRANT_URL: process.env.QDRANT_URL || 'http://localhost:6333',
     DASHBOARD_API_URL: process.env.DASHBOARD_API_URL || 'http://localhost:4000',
+    DASHBOARD_API_KEY: process.env.DASHBOARD_API_KEY || '',
     MCP_SERVER_NAME: process.env.MCP_SERVER_NAME || 'corn-hub-local',
     MCP_SERVER_VERSION: process.env.MCP_SERVER_VERSION || '0.1.0',
     API_KEYS: '',
@@ -108,9 +110,11 @@ async function run() {
       const latencyMs = Date.now() - req.start
       const status = message.error ? 'error' : 'ok'
 
+      const telemetryHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (env.DASHBOARD_API_KEY) telemetryHeaders['X-API-Key'] = env.DASHBOARD_API_KEY
       fetch(`${apiUrl}/api/metrics/query-log`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: telemetryHeaders,
         body: JSON.stringify({
           agentId: envWithOwner.API_KEY_OWNER,
           tool: req.tool,

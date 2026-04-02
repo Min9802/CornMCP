@@ -1,20 +1,29 @@
 import { Hono } from 'hono'
 import { dbAll, dbGet, dbRun } from '../db/client.js'
+import { anyAuthMiddleware, getAuthCtx } from '../middleware/auth.js'
 
 export const analyticsRouter = new Hono()
 
+analyticsRouter.use('*', anyAuthMiddleware)
+
 // ─── Tool analytics ─────────────────────────────────────
 analyticsRouter.get('/tool-analytics', async (c) => {
+  const { user, keyIds } = getAuthCtx(c)
   const days = Number(c.req.query('days') || '7')
   const agentId = c.req.query('agentId')
   const projectId = c.req.query('projectId')
 
   let whereClause = `WHERE created_at >= datetime('now', '-' || ? || ' days')`
   const params: unknown[] = [days]
+
+  // Scope to user's keys unless admin
+  if (user.role !== 'admin' && keyIds.length > 0) {
+    whereClause += ` AND agent_id IN (${keyIds.map(() => '?').join(',')})`
+    params.push(...keyIds)
+  }
   if (agentId) { whereClause += ' AND agent_id = ?'; params.push(agentId) }
   if (projectId) { whereClause += ' AND project_id = ?'; params.push(projectId) }
 
-  // Summary
   const summary = await dbGet(
     `SELECT COUNT(*) as totalCalls,
             ROUND(100.0 * SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as overallSuccessRate,
@@ -25,7 +34,6 @@ analyticsRouter.get('/tool-analytics', async (c) => {
     params,
   )
 
-  // Per-tool breakdown
   const tools = await dbAll(
     `SELECT tool,
             COUNT(*) as totalCalls,
@@ -37,7 +45,6 @@ analyticsRouter.get('/tool-analytics', async (c) => {
     params,
   )
 
-  // Per-agent breakdown
   const agents = await dbAll(
     `SELECT agent_id as agentId,
             COUNT(*) as totalCalls,
@@ -47,7 +54,6 @@ analyticsRouter.get('/tool-analytics', async (c) => {
     params,
   )
 
-  // Daily trend
   const trend = await dbAll(
     `SELECT date(created_at) as day,
             COUNT(*) as calls,
@@ -59,11 +65,11 @@ analyticsRouter.get('/tool-analytics', async (c) => {
 
   return c.json({
     summary: {
-      totalCalls: summary?.totalCalls || 0,
-      overallSuccessRate: summary?.overallSuccessRate || 0,
-      estimatedTokensSaved: summary?.estimatedTokensSaved || 0,
-      totalDataBytes: summary?.totalDataBytes || 0,
-      activeAgents: summary?.activeAgents || 0,
+      totalCalls: summary?.['totalCalls'] || 0,
+      overallSuccessRate: summary?.['overallSuccessRate'] || 0,
+      estimatedTokensSaved: summary?.['estimatedTokensSaved'] || 0,
+      totalDataBytes: summary?.['totalDataBytes'] || 0,
+      activeAgents: summary?.['activeAgents'] || 0,
     },
     tools,
     agents,

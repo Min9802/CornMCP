@@ -3,8 +3,18 @@ import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { checkHealth } from '@/lib/api'
 
+function useServiceUrls() {
+  if (typeof window === 'undefined') return { apiUrl: '', mcpUrl: '' }
+  const host = window.location.hostname
+  return {
+    apiUrl: `http://${host}:4000`,
+    mcpUrl: `http://${host}:8317`,
+  }
+}
+
 export default function SettingsPage() {
   const { data: health } = useSWR('health', checkHealth, { refreshInterval: 30000 })
+  const { apiUrl, mcpUrl } = useServiceUrls()
 
   return (
     <DashboardLayout title="Settings" subtitle="System configuration and version info">
@@ -33,10 +43,10 @@ export default function SettingsPage() {
         <h3 style={{ fontWeight: 600, marginBottom: 'var(--space-4)' }}>🔗 Service Endpoints</h3>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
           {[
-            { name: 'MCP Server', url: 'http://localhost:8317/mcp' },
-            { name: 'Dashboard API', url: 'http://localhost:4000' },
-            { name: 'Health (MCP)', url: 'http://localhost:8317/health' },
-            { name: 'Health (API)', url: 'http://localhost:4000/health' },
+            { name: 'MCP Server', url: `${mcpUrl}/mcp` },
+            { name: 'Dashboard API', url: apiUrl },
+            { name: 'Health (MCP)', url: `${mcpUrl}/health` },
+            { name: 'Health (API)', url: `${apiUrl}/health` },
           ].map((ep) => (
             <div key={ep.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: 'var(--space-3) var(--space-4)', background: 'var(--bg-input)', borderRadius: 'var(--radius-sm)' }}>
               <span style={{ fontWeight: 500 }}>{ep.name}</span>
@@ -55,7 +65,7 @@ export default function SettingsPage() {
 {`{
   "mcpServers": {
     "corn-hub": {
-      "url": "http://localhost:8317/mcp",
+      "url": "${mcpUrl}/mcp",
       "headers": {
         "Authorization": "Bearer <your-api-key>"
       }
