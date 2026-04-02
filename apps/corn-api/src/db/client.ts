@@ -43,6 +43,7 @@ export async function getDb(): Promise<Database> {
       `ALTER TABLE organizations ADD COLUMN user_id TEXT`,
       `ALTER TABLE knowledge_documents ADD COLUMN user_id TEXT`,
       `ALTER TABLE quality_reports ADD COLUMN user_id TEXT`,
+      `ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`,
     ]
     for (const migration of migrations) {
       try { db.run(migration) } catch { /* column already exists */ }

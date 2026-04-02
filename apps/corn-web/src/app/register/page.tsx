@@ -34,6 +34,11 @@ export default function RegisterPage() {
       return
     }
 
+    if (result.needsVerification) {
+      router.push(`/verify?email=${encodeURIComponent(email)}`)
+      return
+    }
+
     router.push('/login')
   }
 

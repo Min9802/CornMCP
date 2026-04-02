@@ -26,6 +26,10 @@ function LoginForm() {
     setLoading(false)
 
     if (!result.ok) {
+      if (result.needsVerification) {
+        router.push(`/verify?email=${encodeURIComponent(result.email || email)}`)
+        return
+      }
       setError(result.error || 'Login failed')
       return
     }

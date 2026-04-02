@@ -17,11 +17,13 @@
     "bcryptjs": "^2.4.3",
     "hono": "^4.7.0",
     "jose": "^5.9.6",
+    "nodemailer": "^8.0.4",
     "sql.js": "^1.12.0",
     "typescript": "^5.7.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
+    "@types/nodemailer": "^7.0.11",
     "@types/sql.js": "^1.4.10",
     "tsx": "^4.19.0"
   }

@@ -10,7 +10,7 @@ export interface AuthUser {
 export async function login(
   email: string,
   password: string,
-): Promise<{ ok: boolean; user?: AuthUser; error?: string }> {
+): Promise<{ ok: boolean; user?: AuthUser; error?: string; needsVerification?: boolean; email?: string }> {
   try {
     const res = await fetch(`${API_BASE}/api/auth/login`, {
       method: 'POST',
@@ -19,6 +19,9 @@ export async function login(
       credentials: 'include',
     })
     const data = await res.json()
+    if (res.status === 403 && data.needsVerification) {
+      return { ok: false, needsVerification: true, email: data.email }
+    }
     if (!res.ok) return { ok: false, error: data.error || 'Login failed' }
     return { ok: true, user: data.user }
   } catch {
@@ -30,7 +33,7 @@ export async function register(
   email: string,
   password: string,
   name: string,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; needsVerification?: boolean }> {
   try {
     const res = await fetch(`${API_BASE}/api/auth/register`, {
       method: 'POST',
@@ -40,7 +43,7 @@ export async function register(
     })
     const data = await res.json()
     if (!res.ok) return { ok: false, error: data.error || 'Registration failed' }
-    return { ok: true }
+    return { ok: true, needsVerification: data.needsVerification }
   } catch {
     return { ok: false, error: 'Network error — is the API running?' }
   }
@@ -53,6 +56,43 @@ export async function logout(): Promise<void> {
   // Clear cookie client-side as fallback
   document.cookie = 'corn_token=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/'
   window.location.href = '/login'
+}
+
+export async function verifyOtp(
+  email: string,
+  otp: string,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/verify-otp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, otp }),
+      credentials: 'include',
+    })
+    const data = await res.json()
+    if (!res.ok) return { ok: false, error: data.error || 'Verification failed' }
+    return { ok: true }
+  } catch {
+    return { ok: false, error: 'Network error — is the API running?' }
+  }
+}
+
+export async function resendOtp(
+  email: string,
+): Promise<{ ok: boolean; error?: string; cooldownSeconds?: number }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/resend-otp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+      credentials: 'include',
+    })
+    const data = await res.json()
+    if (!res.ok) return { ok: false, error: data.error, cooldownSeconds: data.cooldownSeconds }
+    return { ok: true }
+  } catch {
+    return { ok: false, error: 'Network error — is the API running?' }
+  }
 }
 
 export async function getMe(): Promise<AuthUser | null> {

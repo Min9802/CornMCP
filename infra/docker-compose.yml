@@ -58,6 +58,15 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-changeme}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      # Email / OTP
+      APP_NAME: ${APP_NAME:-Corn Hub}
+      MAIL_HOST: ${MAIL_HOST:-}
+      MAIL_PORT: ${MAIL_PORT:-587}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      MAIL_ENCRYPTION: ${MAIL_ENCRYPTION:-tls}
+      MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:-}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Corn Hub}
       # Using Voyage AI by default for code embeddings
       MEM9_EMBEDDING_MODEL: ${MEM9_EMBEDDING_MODEL:-voyage-code-3}
     depends_on:
