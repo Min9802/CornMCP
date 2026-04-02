@@ -2,6 +2,33 @@
 
 All notable changes to Corn Hub will be documented in this file.
 
+## [0.3.2] - 2026-04-02
+
+### Added
+- **Google OAuth login**: "Continue with Google" button on login page
+  - `GET /api/auth/google` → redirects to Google consent screen
+  - `GET /api/auth/google/callback` → exchanges code, creates/links user, sets JWT cookie
+  - New users via Google always get `user` role (unless first user ever → `admin`)
+  - Existing users can link Google to their account by logging in with Google using the same email
+  - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` env vars (no extra packages needed — uses native `fetch`)
+- **DB schema**: `users.google_id` (unique), `users.avatar_url`, `password_hash` now nullable (Google-only users have no password)
+- **Login page**: Google button + "or" divider above the email/password form; OAuth error messages mapped to human-readable strings
+
+## [0.3.1] - 2026-04-02
+
+### Fixed
+- **Docker build error**: `.dockerignore` changed from `node_modules` to `**/node_modules` to exclude all nested node_modules (was causing `cannot copy to non-directory` error on Ubuntu)
+- **Port conflict**: `corn-api` host port changed from `4000` to `6100` to avoid conflict with other services
+
+### Added
+- **Configurable ports via `.env`**: Added `API_PORT`, `MCP_PORT`, `WEB_PORT` variables — host ports now driven from `.env` with fallback defaults
+- **`NEXT_PUBLIC_MCP_URL`**: New env var for MCP server public URL, passed as Docker build arg to `corn-web`
+- **`Dockerfile.corn-web`**: Added `ARG/ENV NEXT_PUBLIC_MCP_URL` in builder stage
+
+### Changed
+- **Setup & Settings pages**: `useServiceUrls()` now reads from `process.env.NEXT_PUBLIC_API_URL` and `process.env.NEXT_PUBLIC_MCP_URL` instead of constructing URLs from `window.location.hostname + hardcoded ports`
+- **Nginx `/mcp/` routing**: Must use trailing slash on both `location /mcp/` and `proxy_pass http://127.0.0.1:8317/` to correctly strip the `/mcp` prefix when forwarding to MCP container
+
 ## [0.3.0] - 2026-04-02
 
 ### Added

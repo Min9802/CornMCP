@@ -619,11 +619,13 @@ cd apps/corn-mcp && npx tsx src/node.ts
 cd apps/corn-web && npx next dev
 ```
 
-| Service | Port | Description |
+| Service | Port (default) | Description |
 |---------|------|-------------|
-| **corn-api** | `:4000` | Hono REST API + SQLite + AST Engine |
+| **corn-api** | `:6100` (host) → `:4000` (container) | Hono REST API + SQLite + AST Engine |
 | **corn-mcp** | `:8317` | MCP Gateway (HTTP transport) |
 | **corn-web** | `:3000` | Next.js Dashboard |
+
+> Host ports are configurable via `API_PORT`, `MCP_PORT`, `WEB_PORT` in `infra/.env`.
 
 ### IDE Configuration
 
@@ -648,7 +650,7 @@ cd apps/corn-web && npx next dev
 {
   "mcpServers": {
     "corn-hub": {
-      "url": "http://your-server:8317/mcp",
+      "url": "https://your-domain.com/mcp",
       "headers": {
         "Authorization": "Bearer <your-api-key>"
       }
@@ -656,6 +658,8 @@ cd apps/corn-web && npx next dev
   }
 }
 ```
+
+> **Nginx note**: When proxying `/mcp/` to the MCP container, use trailing slashes on both `location /mcp/` and `proxy_pass http://127.0.0.1:8317/` to strip the prefix correctly.
 
 > Generate your API key in the Dashboard → **Keys** page after logging in.
 
@@ -754,7 +758,11 @@ CornMCP includes a built-in authentication system:
 | `MEM9_FALLBACK_MODELS` | `voyage-4-large,voyage-4,voyage-code-2,voyage-4-lite` | Fallback model rotation chain |
 | `GEMINI_API_KEY` | — | Google Gemini API key (optional) |
 | `NEXT_PUBLIC_API_URL` | `http://localhost:4000` | API URL used by the dashboard frontend |
+| `NEXT_PUBLIC_MCP_URL` | `http://localhost:8317` | MCP server URL used by the dashboard frontend |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant vector database URL |
+| `API_PORT` | `6100` | Host port mapped to corn-api container |
+| `MCP_PORT` | `8317` | Host port mapped to corn-mcp container |
+| `WEB_PORT` | `3000` | Host port mapped to corn-web container |
 
 ### Model Rotation
 

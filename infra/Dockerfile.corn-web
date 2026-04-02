@@ -30,6 +30,9 @@ WORKDIR /app
 ARG NEXT_PUBLIC_API_URL=http://localhost:4000
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 
+ARG NEXT_PUBLIC_MCP_URL=http://localhost:8317
+ENV NEXT_PUBLIC_MCP_URL=${NEXT_PUBLIC_MCP_URL}
+
 COPY . .
 # Restore scoped workspace yaml
 RUN printf 'packages:\n  - "apps/corn-web"\n' > pnpm-workspace.yaml
