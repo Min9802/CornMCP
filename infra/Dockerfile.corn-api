@@ -96,8 +96,9 @@ RUN mkdir -p /app/node_modules/@corn && \
     ln -sf /app/packages/shared-mem9 /app/node_modules/@corn/shared-mem9
 
 # Runtime assets
-RUN mkdir -p /app/apps/corn-api/dist/db
+RUN mkdir -p /app/apps/corn-api/dist/db/migrations
 COPY --from=builder /app/apps/corn-api/src/db/schema.sql ./apps/corn-api/dist/db/schema.sql
+COPY --from=builder /app/apps/corn-api/src/db/migrations/ ./apps/corn-api/dist/db/migrations/
 COPY --from=builder /app/version.json ./version.json
 
 # Dashboard Web static export (ensure dir exists even if corn-web build was skipped)
