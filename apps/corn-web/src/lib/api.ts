@@ -81,6 +81,15 @@ export const createProject = (data: { name: string; description?: string; gitRep
     body: JSON.stringify(data),
   })
 
+export const updateProject = (id: string, data: { name: string; description?: string; gitRepoUrl?: string }) =>
+  apiFetch<{ ok: boolean }>(`/api/projects/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+
+export const deleteProject = (id: string) =>
+  apiFetch<{ ok: boolean }>(`/api/projects/${id}`, { method: 'DELETE' })
+
 // ─── Knowledge ──────────────────────────────────────────
 export const getKnowledgeDocs = (limit = 50) =>
   apiFetch<{ documents: any[] }>(`/api/knowledge?limit=${limit}`)

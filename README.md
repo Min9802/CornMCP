@@ -859,4 +859,4 @@ See the [GitHub Releases](https://github.com/Min9802/CornMCP/releases) page and 
 
 ## License
 
-MIT © [yuki-20](https://github.com/yuki-20)
+MIT © [Min9802](https://github.com/Min9802)
