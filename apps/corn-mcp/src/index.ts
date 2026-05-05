@@ -269,10 +269,13 @@ app.all('/mcp', async (c) => {
     const latencyMs = Date.now() - startTime
 
     // Log to Dashboard API (best effort)
+    // Use envWithOwner so the forwarded per-user API key (line 220) is used
+    // for X-API-Key header; falls back to global c.env.DASHBOARD_API_KEY only
+    // if a request arrived without a user key.
     if (toolName !== 'unknown') {
-      const apiUrl = (c.env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
+      const apiUrl = (envWithOwner.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
       const telemetryHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
-      if (c.env.DASHBOARD_API_KEY) telemetryHeaders['X-API-Key'] = c.env.DASHBOARD_API_KEY
+      if (envWithOwner.DASHBOARD_API_KEY) telemetryHeaders['X-API-Key'] = envWithOwner.DASHBOARD_API_KEY
       fetch(`${apiUrl}/api/metrics/query-log`, {
         method: 'POST',
         headers: telemetryHeaders,
