@@ -10,3 +10,6 @@ out/
 data/
 package-lock.json
 *.zip
+
+SESSION_HANDOFF.md
+SESSION_HANDOFF_archive_*.md
