@@ -33,9 +33,29 @@ export async function getDb(): Promise<Database> {
   const __dir = dirname(fileURLToPath(import.meta.url))
 
   try {
-    // 1. Run base schema (CREATE TABLE IF NOT EXISTS — always idempotent)
+    // 1. Run base schema per statement (CREATE TABLE / INDEX IF NOT EXISTS — idempotent).
+    //    Statements that reference columns added by later migrations (e.g. a new
+    //    index on a new column) may transiently fail on pre-migration DBs; those
+    //    errors are benign and migrations below will bring the schema up to date.
     const schema = readFileSync(join(__dir, 'schema.sql'), 'utf-8')
-    db.run(schema)
+    const schemaStatements = schema.split(';').map((s) => s.trim()).filter(Boolean)
+    for (const stmt of schemaStatements) {
+      try {
+        db.run(stmt)
+      } catch (err) {
+        const msg = (err as Error).message || ''
+        if (
+          msg.includes('duplicate column') ||
+          msg.includes('already exists') ||
+          msg.includes('no such column') ||
+          msg.includes('no such table')
+        ) {
+          // Benign — migrations will reconcile schema
+          continue
+        }
+        throw err
+      }
+    }
 
     // 2. Ensure migrations tracking table exists
     db.run(`CREATE TABLE IF NOT EXISTS schema_migrations (
