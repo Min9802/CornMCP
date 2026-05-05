@@ -20,6 +20,7 @@ import { systemRouter } from './routes/system.js'
 import { indexingRouter } from './routes/indexing.js'
 import { authRouter } from './routes/auth.js'
 import { usersRouter } from './routes/users.js'
+import { startSessionLifecycleJob } from './services/session-lifecycle.js'
 
 const app = new Hono()
 const logger = createLogger('corn-api')
@@ -116,6 +117,23 @@ async function start() {
   // Initialize database before serving
   await getDb()
   logger.info('Database ready')
+
+  // ── Session auto-close sweep ────────────────────────────
+  // Sessions stuck in 'active' (e.g. agent crashed before corn_session_end)
+  // are flipped to 'abandoned' after `SESSION_AUTO_CLOSE_MINUTES` of no
+  // activity. PATCH and POST /:id/heartbeat both refresh activity.
+  const timeoutMinutes = Math.max(
+    1,
+    Number(process.env['SESSION_AUTO_CLOSE_MINUTES']) || 60,
+  )
+  const checkIntervalMs = Math.max(
+    30_000,
+    Number(process.env['SESSION_CHECK_INTERVAL_MS']) || 5 * 60_000,
+  )
+  startSessionLifecycleJob({ timeoutMinutes, checkIntervalMs })
+  logger.info(
+    `Session auto-close enabled (timeout=${timeoutMinutes}m, check=${Math.round(checkIntervalMs / 1000)}s)`,
+  )
 
   serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, () => {
     logger.info(`🌽 Corn Dashboard API listening on http://0.0.0.0:${port}`)

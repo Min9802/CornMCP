@@ -51,7 +51,7 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
         content: [
           {
             type: 'text' as const,
-            text: `✅ Session started: ${sessionId}\n\nProject: ${project}\nBranch: ${branch || 'main'}\nTask: ${taskSummary}\n\n💡 Remember to call corn_session_end when you finish.`,
+            text: `✅ Session started: ${sessionId}\n\nProject: ${project}\nBranch: ${branch || 'main'}\nTask: ${taskSummary}\n\n💡 Remember to call corn_session_end when you finish. Sessions auto-close after extended inactivity (server default: 60m). Any corn_* tool call counts as activity and keeps the session alive.`,
           },
         ],
       }

@@ -64,6 +64,7 @@ export interface Session {
   decisions?: string[]
   blockers?: string[]
   createdAt: string
+  lastActivityAt?: string
   completedAt?: string
 }
 
@@ -75,10 +76,11 @@ export interface SessionHandoff {
   taskSummary: string
   context: Record<string, unknown>
   priority: number
-  status: 'pending' | 'claimed' | 'completed' | 'expired'
+  status: 'pending' | 'claimed' | 'completed' | 'expired' | 'abandoned' | 'active'
   claimedBy?: string
   projectId?: string
   createdAt: string
+  lastActivityAt?: string
   expiresAt?: string
 }
 

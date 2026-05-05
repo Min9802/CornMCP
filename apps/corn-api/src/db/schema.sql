@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS session_handoffs (
     claimed_by TEXT,
     project_id TEXT,
     created_at TEXT DEFAULT (datetime('now')),
+    last_activity_at TEXT DEFAULT (datetime('now')),
     expires_at TEXT
 );
 
@@ -261,6 +262,7 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_docs_project ON knowledge_documents(pro
 CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_doc ON knowledge_chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_change_events_project ON change_events(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_index_jobs_project ON index_jobs(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_session_handoffs_status_activity ON session_handoffs(status, last_activity_at);
 
 -- Default data
 INSERT OR IGNORE INTO setup_status (id, completed) VALUES (1, 0);

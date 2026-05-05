@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { dbAll, dbGet, dbRun } from '../db/client.js'
 import { jwtAuthMiddleware, anyAuthMiddleware, getAuthCtx, getAgentCtx } from '../middleware/auth.js'
+import { touchSession } from '../services/session-lifecycle.js'
 
 export const qualityRouter = new Hono()
 
@@ -63,6 +64,10 @@ qualityRouter.post('/', anyAuthMiddleware, async (c) => {
       userId,
     ],
   )
+
+  // Treat a quality report as session activity so long-running sessions
+  // that submit gates periodically don't get auto-closed.
+  if (body.sessionId) await touchSession(body.sessionId)
 
   return c.json({ ok: true, id: body.id })
 })

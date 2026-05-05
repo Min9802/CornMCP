@@ -1,19 +1,25 @@
 import { Hono } from 'hono'
 import { dbAll, dbGet, dbRun } from '../db/client.js'
 import { apiKeyAuthMiddleware, jwtAuthMiddleware, getAuthCtx, getAgentCtx } from '../middleware/auth.js'
+import { touchSessionsByAgent } from '../services/session-lifecycle.js'
 
 export const metricsRouter = new Hono()
 
 // ─── Log a query (called by MCP server / API key) ────────
+// This endpoint also doubles as an implicit heartbeat for the agent's active
+// sessions: every tool call → telemetry → touchSessionsByAgent → keep-alive.
+// Without this, sessions auto-close after SESSION_AUTO_CLOSE_MINUTES even if
+// the agent is still actively running tools.
 metricsRouter.post('/query-log', apiKeyAuthMiddleware, async (c) => {
   const body = await c.req.json()
   const { agentKeyId } = getAgentCtx(c)
+  const agentId = agentKeyId || body.agentId || 'unknown'
 
   await dbRun(
     `INSERT INTO query_logs (agent_id, tool, params, latency_ms, status, error, project_id, input_size, output_size, compute_tokens, compute_model)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
-      agentKeyId || body.agentId || 'unknown',
+      agentId,
       body.tool || 'unknown',
       body.params ? JSON.stringify(body.params) : null,
       body.latencyMs || 0,
@@ -26,6 +32,12 @@ metricsRouter.post('/query-log', apiKeyAuthMiddleware, async (c) => {
       body.computeModel || null,
     ],
   )
+
+  // Implicit heartbeat — bump last_activity_at on every active session of
+  // this agent. Skips 'unknown' to avoid touching everyone's stale rows.
+  if (agentId !== 'unknown') {
+    await touchSessionsByAgent(agentId)
+  }
 
   return c.json({ ok: true })
 })

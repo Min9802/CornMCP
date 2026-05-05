@@ -175,8 +175,8 @@ sessionsRouter.post('/', apiKeyAuthMiddleware, async (c) => {
   }
 
   await dbRun(
-    `INSERT INTO session_handoffs (id, from_agent, project, task_summary, context, status, project_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO session_handoffs (id, from_agent, project, task_summary, context, status, project_id, last_activity_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
     [
       body.id,
       agentKeyId || body.agentId || 'unknown',
@@ -192,6 +192,8 @@ sessionsRouter.post('/', apiKeyAuthMiddleware, async (c) => {
 })
 
 // PATCH — agent update (API key)
+// Also serves as a heartbeat: any PATCH refreshes `last_activity_at`, so
+// long-running agents that periodically PATCH stay out of the auto-close sweep.
 sessionsRouter.patch('/:id', apiKeyAuthMiddleware, async (c) => {
   const { id } = c.req.param()
   const body = await c.req.json()
@@ -204,9 +206,25 @@ sessionsRouter.patch('/:id', apiKeyAuthMiddleware, async (c) => {
   })
 
   await dbRun(
-    `UPDATE session_handoffs SET status = ?, context = ? WHERE id = ?`,
+    `UPDATE session_handoffs
+     SET status = ?, context = ?, last_activity_at = datetime('now')
+     WHERE id = ?`,
     [body.status || 'completed', context, id],
   )
 
+  return c.json({ ok: true })
+})
+
+// POST /:id/heartbeat — lightweight keep-alive that only refreshes activity.
+// Useful for agents that want to signal "still working" without committing a
+// full status change yet. Idempotent and safe to call frequently.
+sessionsRouter.post('/:id/heartbeat', apiKeyAuthMiddleware, async (c) => {
+  const { id } = c.req.param()
+  await dbRun(
+    `UPDATE session_handoffs
+     SET last_activity_at = datetime('now')
+     WHERE id = ? AND status = 'active'`,
+    [id],
+  )
   return c.json({ ok: true })
 })
