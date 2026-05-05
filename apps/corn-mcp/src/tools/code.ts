@@ -309,7 +309,7 @@ export function registerCodeTools(server: McpServer, env: McpEnv) {
   // ── corn_list_repos — discover indexed repositories ──
   server.tool(
     'corn_list_repos',
-    'List all indexed repositories with project ID mapping. Use this to find which projectId to pass to code tools.',
+    'List all indexed repositories with project ID, slug, and git URL/local path. Match the current workspace by comparing folder name with `name`/`slug`, or `git remote get-url origin` output with `git_repo_url` (which can also be an absolute local path).',
     {},
     async () => {
       try {
@@ -322,16 +322,27 @@ export function registerCodeTools(server: McpServer, env: McpEnv) {
           return { content: [{ type: 'text' as const, text: '📦 No indexed repositories found.\n\n💡 Use the Dashboard → Projects to add and index a repository.' }] }
         }
 
-        const lines = ['📦 **Indexed Repositories**\n', '| # | Repository | Project ID | Symbols | Edges | Indexed |', '|---|-----------|-----------|---------|-------|---------|']
+        const lines = [
+          '📦 **Indexed Repositories**\n',
+          '| # | Repository | Slug | Project ID | Git URL / Local Path | Symbols | Edges | Indexed |',
+          '|---|-----------|------|-----------|----------------------|---------|-------|---------|',
+        ]
         let i = 0
         for (const r of repos as Record<string, unknown>[]) {
           i++
           const symbols = r.live_symbols ?? r.symbols ?? '?'
           const edges = r.edges ?? '?'
           const indexed = r.indexed_at ? '✅' : '⏳'
-          lines.push(`| ${i} | **${r.name ?? 'unknown'}** | \`${r.projectId ?? '(auto)'}\` | ${symbols} | ${edges} | ${indexed} |`)
+          const slug = r.slug ?? '—'
+          const repoUrl = r.git_repo_url ?? '—'
+          lines.push(`| ${i} | **${r.name ?? 'unknown'}** | \`${slug}\` | \`${r.projectId ?? '(auto)'}\` | \`${repoUrl}\` | ${symbols} | ${edges} | ${indexed} |`)
         }
-        lines.push('', `Total: ${repos.length} projects.`, '\n💡 Pass the Project ID to corn_code_search, corn_code_context, corn_code_impact, or corn_cypher.')
+        lines.push(
+          '',
+          `Total: ${repos.length} projects.`,
+          '\n💡 Match strategy: compare current workspace folder/git remote against the **Slug** or **Git URL / Local Path** column to find the right Project ID.',
+          '💡 Pass the Project ID to corn_code_search, corn_code_context, corn_code_impact, or corn_cypher.',
+        )
 
         return { content: [{ type: 'text' as const, text: lines.join('\n') }] }
       } catch (error) {

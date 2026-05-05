@@ -23,34 +23,117 @@ sessionsRouter.get('/', jwtAuthMiddleware, async (c) => {
 })
 
 /**
- * Auto-upsert org + project by name.
- * If project doesn't exist, create it (and its org) for the API key owner.
- * Returns the project ID.
+ * Build common variants of a git remote URL so SSH/HTTPS forms and the
+ * trailing `.git` suffix all collapse to the same project. Examples for
+ * `git@github.com:Min9802/CornMCP.git`:
+ *   git@github.com:Min9802/CornMCP.git
+ *   git@github.com:Min9802/CornMCP
+ *   https://github.com/Min9802/CornMCP
+ *   https://github.com/Min9802/CornMCP.git
  */
-async function ensureProject(projectName: string, userId: string): Promise<string> {
-  const slug = projectName.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+function gitUrlVariants(url: string): string[] {
+  const trimmed = url.trim()
+  if (!trimmed) return []
+  const variants = new Set<string>([trimmed])
+  variants.add(trimmed.replace(/\.git$/, ''))
 
-  // Check if project exists by slug (for this user or globally)
-  let project = await dbGet(
+  const sshMatch = trimmed.match(/^git@([^:]+):(.+?)(?:\.git)?$/)
+  if (sshMatch) {
+    variants.add(`https://${sshMatch[1]}/${sshMatch[2]}`)
+    variants.add(`https://${sshMatch[1]}/${sshMatch[2]}.git`)
+  }
+  const httpsMatch = trimmed.match(/^https?:\/\/([^/]+)\/(.+?)(?:\.git)?$/)
+  if (httpsMatch) {
+    variants.add(`git@${httpsMatch[1]}:${httpsMatch[2]}`)
+    variants.add(`git@${httpsMatch[1]}:${httpsMatch[2]}.git`)
+  }
+  return [...variants]
+}
+
+/** Normalize an absolute path for case-insensitive comparison (Windows-aware). */
+function normalizePath(p: string): string {
+  return p.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+async function findProjectByGitUrl(userId: string, gitRepoUrl: string): Promise<string | null> {
+  for (const variant of gitUrlVariants(gitRepoUrl)) {
+    const p = await dbGet(
+      `SELECT p.id FROM projects p
+       JOIN organizations o ON p.org_id = o.id
+       WHERE LOWER(p.git_repo_url) = LOWER(?) AND (o.user_id = ? OR o.user_id IS NULL)
+       LIMIT 1`,
+      [variant, userId],
+    )
+    if (p) return p['id'] as string
+  }
+  return null
+}
+
+async function findProjectByLocalPath(userId: string, localPath: string): Promise<string | null> {
+  const norm = normalizePath(localPath)
+  if (!norm) return null
+  const projects = await dbAll(
+    `SELECT p.id, p.git_repo_url FROM projects p
+     JOIN organizations o ON p.org_id = o.id
+     WHERE p.git_repo_url IS NOT NULL AND (o.user_id = ? OR o.user_id IS NULL)`,
+    [userId],
+  )
+  for (const p of projects) {
+    const stored = p['git_repo_url'] as string | null
+    if (stored && normalizePath(stored) === norm) return p['id'] as string
+  }
+  return null
+}
+
+async function findProjectByFuzzyName(userId: string, projectName: string): Promise<string | null> {
+  const slug = projectName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+  const fuzzy = projectName.toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (!fuzzy) return null
+  const p = await dbGet(
     `SELECT p.id FROM projects p
      JOIN organizations o ON p.org_id = o.id
-     WHERE p.slug = ? AND (o.user_id = ? OR o.user_id IS NULL)
+     WHERE (
+       p.slug = ?
+       OR REPLACE(REPLACE(LOWER(p.slug), '-', ''), '_', '') = ?
+       OR REPLACE(REPLACE(LOWER(p.name), '-', ''), '_', '') = ?
+     ) AND (o.user_id = ? OR o.user_id IS NULL)
      LIMIT 1`,
-    [slug, userId],
+    [slug, fuzzy, fuzzy, userId],
   )
-  if (project) return project['id'] as string
+  return p ? (p['id'] as string) : null
+}
 
-  // Also try matching by name
-  project = await dbGet(
-    `SELECT p.id FROM projects p
-     JOIN organizations o ON p.org_id = o.id
-     WHERE p.name = ? AND (o.user_id = ? OR o.user_id IS NULL)
-     LIMIT 1`,
-    [projectName, userId],
-  )
-  if (project) return project['id'] as string
+/**
+ * Auto-upsert org + project by name with multi-signal matching.
+ *
+ * Match priority (first hit wins):
+ *   1. `gitRepoUrl` hint — normalized SSH/HTTPS variants matched against `projects.git_repo_url`
+ *   2. `localPath` hint — normalized path matched against `projects.git_repo_url` (dual-purpose field)
+ *   3. Project name — exact slug, then fuzzy comparison ignoring dashes/underscores
+ *
+ * If nothing matches, creates a new project (and default org if needed) for the
+ * API key owner. The hint is persisted into `git_repo_url` so subsequent calls
+ * resolve back to the same row — preventing the duplicate-project bug where
+ * `corn-mcp` (created via UI) and `CornMCP` (created via agent) both exist.
+ */
+async function ensureProject(
+  projectName: string,
+  userId: string,
+  hints?: { gitRepoUrl?: string; localPath?: string },
+): Promise<string> {
+  if (hints?.gitRepoUrl) {
+    const found = await findProjectByGitUrl(userId, hints.gitRepoUrl)
+    if (found) return found
+  }
+  if (hints?.localPath) {
+    const found = await findProjectByLocalPath(userId, hints.localPath)
+    if (found) return found
+  }
 
-  // Ensure a default org for this user
+  const found = await findProjectByFuzzyName(userId, projectName)
+  if (found) return found
+
+  // No match — create new project, persisting the hint for future resolution.
   let org = await dbGet(
     'SELECT id FROM organizations WHERE user_id = ? ORDER BY created_at ASC LIMIT 1',
     [userId],
@@ -64,11 +147,12 @@ async function ensureProject(projectName: string, userId: string): Promise<strin
     org = { id: orgId }
   }
 
-  // Create project
+  const slug = projectName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
   const projId = generateId('proj')
+  const persistedUrl = hints?.gitRepoUrl || hints?.localPath || null
   await dbRun(
-    `INSERT INTO projects (id, org_id, name, slug, description) VALUES (?, ?, ?, ?, ?)`,
-    [projId, org['id'], projectName, slug, `Auto-created from agent session`],
+    `INSERT INTO projects (id, org_id, name, slug, description, git_repo_url) VALUES (?, ?, ?, ?, ?, ?)`,
+    [projId, org['id'], projectName, slug, 'Auto-created from agent session', persistedUrl],
   )
 
   return projId
@@ -79,10 +163,15 @@ sessionsRouter.post('/', apiKeyAuthMiddleware, async (c) => {
   const body = await c.req.json()
   const { agentKeyId, agentUserId } = getAgentCtx(c)
 
-  // Auto-create project if name provided but no projectId
+  // Auto-resolve or create project. Pass gitRepoUrl/localPath hints so the
+  // agent's session links to its existing project (created via UI/CLI) rather
+  // than spawning a duplicate. See ensureProject() for match priority.
   let projectId = body.projectId || null
   if (!projectId && body.project && agentUserId) {
-    projectId = await ensureProject(body.project, agentUserId)
+    projectId = await ensureProject(body.project, agentUserId, {
+      gitRepoUrl: typeof body.gitRepoUrl === 'string' ? body.gitRepoUrl : undefined,
+      localPath: typeof body.localPath === 'string' ? body.localPath : undefined,
+    })
   }
 
   await dbRun(

@@ -13,13 +13,15 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
   // ─── Start Session ───────────────────────────────────
   server.tool(
     'corn_session_start',
-    'Start a new work session. Call this at the beginning of a task to enable session tracking, quality gates, and handoff.',
+    'Start a new work session. Call this at the beginning of a task to enable session tracking, quality gates, and handoff. To prevent duplicate projects, pass `gitRepoUrl` (run `git remote get-url origin`) and/or `localPath` (absolute workspace root) so the server matches your session to the project you already created via the dashboard.',
     {
       project: z.string().describe('Project name or repo path'),
       branch: z.string().optional().describe('Git branch'),
       taskSummary: z.string().describe('Brief description of what you plan to do'),
+      gitRepoUrl: z.string().optional().describe('Git remote URL (output of `git remote get-url origin`). Used to match this session to an existing project, avoiding duplicates. Both SSH and HTTPS forms are accepted.'),
+      localPath: z.string().optional().describe('Absolute path to workspace root. Fallback signal when no git remote is configured — server matches it against `projects.git_repo_url` (dual-purpose field accepts paths).'),
     },
-    async ({ project, branch, taskSummary }) => {
+    async ({ project, branch, taskSummary, gitRepoUrl, localPath }) => {
       const sessionId = generateId('ses')
       const agentId = (env as McpEnv & { API_KEY_OWNER?: string }).API_KEY_OWNER || 'unknown'
 
@@ -36,6 +38,8 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
             branch: branch || 'main',
             taskSummary,
             status: 'active',
+            gitRepoUrl,
+            localPath,
           }),
           signal: AbortSignal.timeout(5000),
         })
