@@ -2,15 +2,7 @@
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getSessions } from '@/lib/api'
-
-function timeAgo(d: string) {
-  const mins = Math.floor((Date.now() - new Date(d).getTime()) / 60000)
-  if (mins < 1) return 'just now'
-  if (mins < 60) return `${mins}m ago`
-  const hrs = Math.floor(mins / 60)
-  if (hrs < 24) return `${hrs}h ago`
-  return `${Math.floor(hrs / 24)}d ago`
-}
+import { timeAgo } from '@/lib/date'
 
 export default function SessionsPage() {
   const { data } = useSWR('sessions', () => getSessions(), { refreshInterval: 10000 })

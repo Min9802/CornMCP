@@ -3,6 +3,7 @@ import { useState } from 'react'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getOrganizations, createOrganization, updateOrganization, deleteOrganization } from '@/lib/api'
+import { formatLocalDate } from '@/lib/date'
 
 export default function OrgsPage() {
   const { data, mutate } = useSWR('orgs', getOrganizations, { refreshInterval: 30000 })
@@ -73,7 +74,7 @@ export default function OrgsPage() {
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{org.description}</p>
             )}
             <div style={{ marginTop: 'var(--space-3)', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-              Created: {new Date(org.created_at).toLocaleDateString()}
+              Created: {formatLocalDate(org.created_at)}
             </div>
           </div>
         ))}

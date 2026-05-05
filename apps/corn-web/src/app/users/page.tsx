@@ -5,6 +5,7 @@ import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getUsers, createUser, updateUser, deleteUser, type UserRecord } from '@/lib/api'
 import { getMe, type AuthUser } from '@/lib/auth'
+import { formatLocalDate } from '@/lib/date'
 
 function initials(name: string) {
   return name.split(' ').map((n) => n[0]).join('').toUpperCase().slice(0, 2)
@@ -160,7 +161,7 @@ export default function UsersPage() {
                     </span>
                   </td>
                   <td style={{ padding: 'var(--space-4) var(--space-5)', color: 'var(--text-muted)', fontSize: '0.8rem' }}>
-                    {new Date(u.created_at).toLocaleDateString()}
+                    {formatLocalDate(u.created_at)}
                   </td>
                   <td style={{ padding: 'var(--space-4) var(--space-5)' }}>
                     <div style={{ display: 'flex', gap: 'var(--space-2)' }}>

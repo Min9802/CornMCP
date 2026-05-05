@@ -3,6 +3,7 @@ import { useState } from 'react'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getApiKeys, createApiKey, deleteApiKey } from '@/lib/api'
+import { formatLocalDate } from '@/lib/date'
 
 export default function KeysPage() {
   const { data, mutate } = useSWR('keys', getApiKeys, { refreshInterval: 30000 })
@@ -60,8 +61,8 @@ export default function KeysPage() {
                   <td><code style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{k.id}</code></td>
                   <td style={{ fontWeight: 600 }}>{k.name}</td>
                   <td><span className="badge badge-info">{k.scope}</span></td>
-                  <td style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>{new Date(k.created_at).toLocaleDateString()}</td>
-                  <td style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>{k.last_used_at ? new Date(k.last_used_at).toLocaleDateString() : '—'}</td>
+                  <td style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>{formatLocalDate(k.created_at)}</td>
+                  <td style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>{k.last_used_at ? formatLocalDate(k.last_used_at) : '—'}</td>
                   <td><button className="btn btn-danger btn-sm" onClick={() => handleDelete(k.id)}>Delete</button></td>
                 </tr>
               ))

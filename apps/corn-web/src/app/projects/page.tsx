@@ -3,6 +3,7 @@ import { useState } from 'react'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getProjects, createProject, updateProject, deleteProject } from '@/lib/api'
+import { formatLocalDate } from '@/lib/date'
 
 export default function ProjectsPage() {
   const { data, mutate } = useSWR('projects', getProjects, { refreshInterval: 30000 })
@@ -83,7 +84,7 @@ export default function ProjectsPage() {
               )}
               <div style={{ display: 'flex', gap: 'var(--space-4)', marginTop: 'var(--space-4)', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                 <span>🧬 {p.indexed_symbols || 0} symbols</span>
-                <span>📅 {new Date(p.created_at).toLocaleDateString()}</span>
+                <span>📅 {formatLocalDate(p.created_at)}</span>
               </div>
             </div>
           ))
