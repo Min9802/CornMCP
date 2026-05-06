@@ -332,8 +332,6 @@ code, pre {
 }
 
 /* ─── Mobile responsive ────────────────────────────────── */
-@media (max-width: 768px) {
-  :root {
-    --sidebar-width: 0px;
-  }
-}
+/* Note: --sidebar-width stays 260px on mobile so the off-canvas drawer
+   keeps its real width when slid in. Main content fills the screen via
+   `.main { margin-left: 0 }` in DashboardLayout.module.css. */

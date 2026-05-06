@@ -9,6 +9,86 @@ const logger = createLogger('db')
 let db: Database | null = null
 let dbPath: string = ''
 
+/**
+ * Split a SQL script into individual statements, respecting:
+ *   - line comments (`-- ... \n`)
+ *   - block comments (`/* ... *\/`)
+ *   - single/double-quoted string literals (with `''` / `""` escaping)
+ *
+ * A naive `sql.split(';')` is unsafe because a `;` inside a comment or a string
+ * literal would split mid-statement. Example regression: a migration comment
+ * "Real vector data lives in mem9-vectors.db; this table is the preview layer"
+ * caused sql.js to choke on `near "this": syntax error`.
+ *
+ * Note: this splitter does NOT understand `BEGIN ... END;` blocks (used by
+ * SQLite triggers). The current schema doesn't use them; if added later, this
+ * helper must be extended.
+ */
+function splitSqlStatements(sql: string): string[] {
+  const out: string[] = []
+  let buf = ''
+  let i = 0
+  const n = sql.length
+  let inString: '"' | "'" | null = null
+
+  while (i < n) {
+    const ch = sql[i]
+    const next = sql[i + 1]
+
+    if (inString) {
+      buf += ch
+      if (ch === inString) {
+        // Escaped quote: '' or "" stays inside string
+        if (next === inString) {
+          buf += next
+          i += 2
+          continue
+        }
+        inString = null
+      }
+      i++
+      continue
+    }
+
+    if (ch === "'" || ch === '"') {
+      inString = ch
+      buf += ch
+      i++
+      continue
+    }
+
+    // Line comment: skip until newline (keep the newline so following SQL stays
+    // on its own line for readability when re-emitted by sql.js errors).
+    if (ch === '-' && next === '-') {
+      while (i < n && sql[i] !== '\n') i++
+      continue
+    }
+
+    // Block comment
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i++
+      i += 2
+      continue
+    }
+
+    if (ch === ';') {
+      const trimmed = buf.trim()
+      if (trimmed) out.push(trimmed)
+      buf = ''
+      i++
+      continue
+    }
+
+    buf += ch
+    i++
+  }
+
+  const tail = buf.trim()
+  if (tail) out.push(tail)
+  return out
+}
+
 export async function getDb(): Promise<Database> {
   if (db) return db
 
@@ -38,7 +118,7 @@ export async function getDb(): Promise<Database> {
     //    index on a new column) may transiently fail on pre-migration DBs; those
     //    errors are benign and migrations below will bring the schema up to date.
     const schema = readFileSync(join(__dir, 'schema.sql'), 'utf-8')
-    const schemaStatements = schema.split(';').map((s) => s.trim()).filter(Boolean)
+    const schemaStatements = splitSqlStatements(schema)
     for (const stmt of schemaStatements) {
       try {
         db.run(stmt)
@@ -80,8 +160,8 @@ export async function getDb(): Promise<Database> {
         if (applied.has(file)) continue
         const sql = readFileSync(join(migrationsDir, file), 'utf-8')
         try {
-          // Split by ';' to handle multi-statement migrations
-          const statements = sql.split(';').map((s) => s.trim()).filter(Boolean)
+          // Split into individual statements while respecting comments/strings.
+          const statements = splitSqlStatements(sql)
           for (const stmt of statements) {
             db.run(stmt)
           }
