@@ -5,6 +5,12 @@ import { LocalMem9Service, OpenAIEmbeddingProvider, LocalHashEmbeddingProvider }
 import type { EmbeddingProvider } from '@corn/shared-mem9'
 import { generateId } from '@corn/shared-utils'
 
+function apiHeaders(env: McpEnv): Record<string, string> {
+  const h: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (env.DASHBOARD_API_KEY) h['X-API-Key'] = env.DASHBOARD_API_KEY
+  return h
+}
+
 let mem9: LocalMem9Service | null = null
 let usingFallback = false
 
@@ -73,6 +79,28 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
         branch: branch || null,
         tags: tags || [],
       })
+
+      // Best-effort: register a preview row in Dashboard API so the web UI
+      // can list/audit/delete memories. Failure here must not break the MCP
+      // tool — the canonical vector data is already persisted locally above.
+      try {
+        const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
+        await fetch(`${apiUrl}/api/memories`, {
+          method: 'POST',
+          headers: apiHeaders(env),
+          body: JSON.stringify({
+            id,
+            content,
+            agentId,
+            projectId: projectId || null,
+            branch: branch || null,
+            tags: tags || [],
+          }),
+          signal: AbortSignal.timeout(5000),
+        })
+      } catch {
+        // Dashboard API registration is best-effort
+      }
 
       return {
         content: [

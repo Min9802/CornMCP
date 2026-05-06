@@ -137,6 +137,22 @@ CREATE TABLE IF NOT EXISTS knowledge_documents (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Dashboard preview layer for memories stored by MCP into local mem9 vector DB.
+-- Real vector data lives in apps/corn-mcp/data/mem9-vectors.db; this table is
+-- only for list/audit/delete from the web dashboard.
+CREATE TABLE IF NOT EXISTS agent_memories (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    content_preview TEXT,
+    agent_id TEXT,
+    project_id TEXT,
+    branch TEXT,
+    tags TEXT DEFAULT '[]',
+    user_id TEXT,
+    hit_count INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS quality_reports (
     id TEXT PRIMARY KEY,
     project_id TEXT,
@@ -260,6 +276,10 @@ CREATE INDEX IF NOT EXISTS idx_quality_reports_project ON quality_reports(projec
 CREATE INDEX IF NOT EXISTS idx_quality_reports_agent ON quality_reports(agent_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_knowledge_docs_project ON knowledge_documents(project_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_doc ON knowledge_chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_agent_memories_agent ON agent_memories(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_memories_project ON agent_memories(project_id);
+CREATE INDEX IF NOT EXISTS idx_agent_memories_user ON agent_memories(user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_memories_project_branch ON agent_memories(project_id, branch);
 CREATE INDEX IF NOT EXISTS idx_change_events_project ON change_events(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_index_jobs_project ON index_jobs(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_session_handoffs_status_activity ON session_handoffs(status, last_activity_at);

@@ -14,6 +14,7 @@ const NAV_ITEMS = [
   { href: '/quality', icon: '🏆', label: 'Quality' },
   { href: '/projects', icon: '📁', label: 'Projects' },
   { href: '/knowledge', icon: '📚', label: 'Knowledge' },
+  { href: '/memory', icon: '💭', label: 'Memory' },
   { href: '/providers', icon: '🧠', label: 'Providers' },
   { href: '/usage', icon: '📊', label: 'Usage' },
   { href: '/keys', icon: '🔑', label: 'API Keys' },

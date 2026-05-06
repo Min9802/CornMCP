@@ -8,6 +8,7 @@ import { keysRouter } from './routes/keys.js'
 import { sessionsRouter } from './routes/sessions.js'
 import { qualityRouter } from './routes/quality.js'
 import { knowledgeRouter } from './routes/knowledge.js'
+import { memoryRouter } from './routes/memory.js'
 import { projectsRouter, orgsRouter } from './routes/projects.js'
 import { metricsRouter } from './routes/stats.js'
 import { providersRouter } from './routes/providers.js'
@@ -77,6 +78,7 @@ app.route('/api/keys', keysRouter)
 app.route('/api/sessions', sessionsRouter)
 app.route('/api/quality', qualityRouter)
 app.route('/api/knowledge', knowledgeRouter)
+app.route('/api/memories', memoryRouter)
 app.route('/api/projects', projectsRouter)
 app.route('/api/orgs', orgsRouter)
 app.route('/api/metrics', metricsRouter)
@@ -100,6 +102,7 @@ app.get('/', (c) => {
       '/api/sessions',
       '/api/quality',
       '/api/knowledge',
+      '/api/memories',
       '/api/projects',
       '/api/orgs',
       '/api/metrics',

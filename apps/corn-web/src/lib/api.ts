@@ -94,6 +94,19 @@ export const deleteProject = (id: string) =>
 export const getKnowledgeDocs = (limit = 50) =>
   apiFetch<{ documents: any[] }>(`/api/knowledge?limit=${limit}`)
 
+// ─── Memory ─────────────────────────────────────────────
+export const getMemories = (params?: { limit?: number; projectId?: string; branch?: string; agentId?: string }) => {
+  const qs = new URLSearchParams()
+  qs.set('limit', String(params?.limit ?? 50))
+  if (params?.projectId) qs.set('projectId', params.projectId)
+  if (params?.branch) qs.set('branch', params.branch)
+  if (params?.agentId) qs.set('agentId', params.agentId)
+  return apiFetch<{ memories: any[] }>(`/api/memories?${qs.toString()}`)
+}
+
+export const deleteMemory = (id: string) =>
+  apiFetch<{ ok: boolean }>(`/api/memories/${id}`, { method: 'DELETE' })
+
 // ─── Keys ───────────────────────────────────────────────
 export const getApiKeys = () => apiFetch<{ keys: any[] }>('/api/keys')
 
