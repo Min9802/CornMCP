@@ -11,6 +11,8 @@ data/
 package-lock.json
 *.zip
 
+.windsurf
 SESSION_HANDOFF.md
 SESSION_HANDOFF_archive_*.md
-.windsurf
+PROJECT_CONTEXT.md
+.agent/workflows/rules_handoff_cornhub.md

@@ -61,12 +61,15 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
   // ─── Store Memory ────────────────────────────────────
   server.tool(
     'corn_memory_store',
-    'Store a memory for later recall. Agents remember across sessions. Include project and branch for scoped recall.',
+    'Store a memory scoped to a specific project. projectId is REQUIRED — memory is project-isolated to prevent cross-project pollution. For cross-project shared knowledge (patterns, decisions, conventions), use corn_knowledge_store instead.',
     {
       content: z.string().describe('The memory content to store'),
-      projectId: z.string().optional().describe('Project scope for the memory'),
+      projectId: z
+        .string()
+        .min(1)
+        .describe('REQUIRED. Project scope for the memory (e.g. proj-xxx). Memories are isolated per project. Use corn_knowledge_store for cross-project items.'),
       branch: z.string().optional().describe('Git branch scope'),
-      tags: z.array(z.string()).optional().describe('Tags for categorization'),
+      tags: z.array(z.string()).optional().describe('Tags for categorization (e.g. ["session-log", "<feature>"])'),
     },
     async ({ content, projectId, branch, tags }) => {
       const svc = await getMem9(env)
@@ -75,7 +78,7 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
 
       await svc.storeMemory(id, content, {
         agent_id: agentId,
-        project_id: projectId || null,
+        project_id: projectId,
         branch: branch || null,
         tags: tags || [],
       })
@@ -92,7 +95,7 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
             id,
             content,
             agentId,
-            projectId: projectId || null,
+            projectId,
             branch: branch || null,
             tags: tags || [],
           }),
@@ -106,7 +109,7 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
         content: [
           {
             type: 'text' as const,
-            text: `✅ Memory stored (id: ${id})\n\nContent: "${content.slice(0, 100)}${content.length > 100 ? '...' : ''}"`,
+            text: `✅ Memory stored (id: ${id}, project: ${projectId})\n\nContent: "${content.slice(0, 100)}${content.length > 100 ? '...' : ''}"`,
           },
         ],
       }
@@ -116,33 +119,55 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
   // ─── Search Memory ───────────────────────────────────
   server.tool(
     'corn_memory_search',
-    'Search agent memories by semantic similarity. Returns relevant memories from any agent.',
+    'Search agent memories by semantic similarity within a project (default) or across all projects (opt-in). Use feature/context keywords from the user task (e.g. "auth login", "session timeout"). Run multiple queries with different keywords if the task spans domains.',
     {
-      query: z.string().describe('Natural language search query'),
+      query: z.string().describe('Natural language search query — use feature/context keywords from the task, not generic terms'),
       limit: z.number().optional().default(5).describe('Max results (default: 5)'),
-      projectId: z.string().optional().describe('Filter by project'),
+      projectId: z
+        .string()
+        .optional()
+        .describe('Project scope for the search. REQUIRED unless crossProject is true.'),
       branch: z.string().optional().describe('Filter by branch'),
+      crossProject: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe('Set true to search across ALL projects (rare — only when intentionally pulling lessons from other repos). Mutually exclusive with projectId.'),
     },
-    async ({ query, limit, projectId, branch }) => {
+    async ({ query, limit, projectId, branch, crossProject }) => {
+      // Enforce project scope: either explicit projectId, or explicit cross-project opt-in.
+      if (!crossProject && !projectId) {
+        throw new Error(
+          'corn_memory_search: projectId is required. Pass projectId of the current project, or set crossProject:true to search across all projects.',
+        )
+      }
+      if (crossProject && projectId) {
+        throw new Error(
+          'corn_memory_search: cannot pass both projectId and crossProject:true. Choose one — projectId for scoped search, crossProject:true for global search.',
+        )
+      }
+
       const svc = await getMem9(env)
 
       const filter: Record<string, unknown> = {}
-      if (projectId) filter.project_id = projectId
+      if (!crossProject && projectId) filter.project_id = projectId
       if (branch) filter.branch = branch
 
       const results = await svc.searchMemory(query, limit, Object.keys(filter).length > 0 ? filter : undefined)
 
       if (results.length === 0) {
+        const scopeLabel = crossProject ? 'all projects' : `project ${projectId}`
         return {
           content: [
             {
               type: 'text' as const,
-              text: `No memories found for: "${query}"`,
+              text: `No memories found for "${query}" (scope: ${scopeLabel}).`,
             },
           ],
         }
       }
 
+      const scopeLabel = crossProject ? 'all projects' : `project ${projectId}`
       const formatted = results
         .map(
           (r, i) =>
@@ -154,7 +179,7 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
         content: [
           {
             type: 'text' as const,
-            text: `Found ${results.length} memories:\n\n${formatted}`,
+            text: `Found ${results.length} memories (scope: ${scopeLabel}):\n\n${formatted}`,
           },
         ],
       }

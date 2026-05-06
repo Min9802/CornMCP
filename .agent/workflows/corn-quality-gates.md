@@ -19,8 +19,13 @@ This workflow is **COMPULSORY** for every single task. If you skip a step, the t
 1. ✅ Call `corn_tool_stats` — Display live analytics in the chat
 2. ✅ Call `corn_session_start` — Start a tracked session with project name + task summary
 3. ✅ Call `corn_changes` — Check for recent code changes from other agents
-4. ✅ Call `corn_memory_search` — Search memories related to the current task
-5. ✅ Call `corn_knowledge_search` — Search knowledge base for existing patterns/decisions
+4. ✅ Call `corn_memory_search` — **REQUIRED with `projectId`** of current repo (or set `crossProject:true` to opt-in cross-project). Search by **feature/context keywords** from the user task, not generic terms like "session log".
+   - User asks "fix auth flow" → query `"auth login authentication"`
+   - User asks "tăng timeout session" → query `"session timeout heartbeat"`
+   - User asks "refactor memory tools" → query `"memory store search projectId"`
+   - **Multi-query** if task spans multiple domains (run search 2-3 times with different keyword sets).
+   - Use `crossProject:true` ONLY when intentionally pulling lessons from other repos (rare).
+5. ✅ Call `corn_knowledge_search` — Search knowledge base for existing patterns/decisions (cross-project by default, optionally filter `projectId`).
 
 **⛔ DO NOT PROCEED to Phase 1 until all 5 tools above have been called.**
 
@@ -35,7 +40,7 @@ This workflow is **COMPULSORY** for every single task. If you skip a step, the t
    - **Score MUST be ≥80% to proceed**
    - If score < 80%: STOP. Revise the plan. Resubmit. Repeat until it passes.
    - If score ≥ 80%: Proceed.
-8. ✅ Call `corn_memory_store` — Store the approved plan for future reference
+8. ✅ Call `corn_memory_store` — Store the approved plan for future reference. **REQUIRED**: `projectId` of current repo, `branch` of current branch, `tags: ["plan", "<feature>"]`.
 
 **⛔ DO NOT WRITE ANY CODE until the plan scores ≥80%.**
 
@@ -79,7 +84,7 @@ This workflow is **COMPULSORY** for every single task. If you skip a step, the t
 **ALL 5 calls below are REQUIRED:**
 
 14. ✅ Call `corn_knowledge_store` — Store any reusable patterns, decisions, or bug fixes discovered
-15. ✅ Call `corn_memory_store` — Store a summary of what was accomplished
+15. ✅ Call `corn_memory_store` — Store a summary of what was accomplished. **REQUIRED**: `projectId`, `branch`, `tags: ["session-log", "<feature>"]`. Content should include: what was done, files changed, decisions made, blockers, next steps. This replaces the old `SESSION_HANDOFF.md` Section B (session log) — see `PROJECT_CONTEXT.md` for static repo context.
 16. ✅ Call `corn_health` — Final system health check
 17. ✅ Call `corn_session_end` — End the session with:
     - Summary of what was done
