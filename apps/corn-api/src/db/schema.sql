@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS query_logs (
     input_size INTEGER DEFAULT 0,
     output_size INTEGER DEFAULT 0,
     compute_tokens INTEGER DEFAULT 0,
+    tokens_saved INTEGER DEFAULT 0,
     compute_model TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );

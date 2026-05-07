@@ -72,6 +72,7 @@ export default function DashboardPage() {
         <StatPill icon="📁" value={overview ? String(overview.projects.length) : '...'} label="Projects" />
         <StatPill icon="🤖" value={overview ? formatNumber(overview.totalAgents) : '...'} label="Agents" />
         <StatPill icon="📊" value={overview ? formatNumber(overview.today.queries) : '...'} label="Queries Today" />
+        <StatPill icon="🔥" value={overview ? formatNumber(overview.tokenUsage?.totalComputeTokens ?? 0) : '...'} label="Token Usage" />
         <StatPill icon="💎" value={overview ? formatNumber(overview.tokenSavings?.totalTokensSaved ?? 0) : '...'} label="Tokens Saved" />
         <StatPill icon="🏆" value={overview?.quality.lastGrade ?? '...'} label="Quality" />
         <StatPill icon="⚡" value={overview ? `${Math.floor(overview.uptime / 3600)}h` : '...'} label="Uptime" />

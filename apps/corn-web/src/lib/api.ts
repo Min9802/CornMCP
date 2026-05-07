@@ -44,6 +44,11 @@ export interface DashboardOverview {
     avgTokensPerCall: number
     topTools: { tool: string; tokensSaved: number }[]
   }
+  tokenUsage?: {
+    totalComputeTokens: number
+    totalToolCalls: number
+    avgTokensPerCall: number
+  }
 }
 
 export const getDashboardOverview = () => apiFetch<DashboardOverview>('/api/metrics/overview')

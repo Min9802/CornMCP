@@ -13,6 +13,7 @@ import { registerCodeTools } from './tools/code.js'
 import { registerAnalyticsTools } from './tools/analytics.js'
 import { registerChangeTools } from './tools/changes.js'
 import { validateApiKey } from './middleware/auth.js'
+import { estimateComputeTokens, estimateTokensSaved } from './telemetry/estimate.js'
 import type { Env } from './types.js'
 
 const app = new Hono<{ Bindings: Env }>()
@@ -273,6 +274,21 @@ app.all('/mcp', async (c) => {
     // for X-API-Key header; falls back to global c.env.DASHBOARD_API_KEY only
     // if a request arrived without a user key.
     if (toolName !== 'unknown') {
+      // Best-effort: clone the response so we can measure its body length
+      // without consuming the original stream. Transport runs with
+      // enableJsonResponse, so the body is a finite JSON payload.
+      const status = response.status >= 400 ? 'error' : 'ok'
+      let outputSize = 0
+      try {
+        outputSize = (await response.clone().text()).length
+      } catch {
+        // If clone/read fails (e.g. streamed body), fall back to 0 — usage and
+        // savings simply won't be counted for this call.
+      }
+      const inputSize = bodyText.length
+      const computeTokens = estimateComputeTokens(inputSize, outputSize)
+      const tokensSaved = status === 'ok' ? estimateTokensSaved(toolName, outputSize) : 0
+
       const apiUrl = (envWithOwner.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
       const telemetryHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
       if (envWithOwner.DASHBOARD_API_KEY) telemetryHeaders['X-API-Key'] = envWithOwner.DASHBOARD_API_KEY
@@ -282,9 +298,12 @@ app.all('/mcp', async (c) => {
         body: JSON.stringify({
           agentId: envWithOwner.API_KEY_OWNER || 'unknown',
           tool: toolName,
-          status: response.status >= 400 ? 'error' : 'ok',
+          status,
           latencyMs,
-          inputSize: bodyText.length,
+          inputSize,
+          outputSize,
+          computeTokens,
+          tokensSaved,
         }),
       }).catch(() => {})
     }

@@ -16,8 +16,8 @@ metricsRouter.post('/query-log', apiKeyAuthMiddleware, async (c) => {
   const agentId = agentKeyId || body.agentId || 'unknown'
 
   await dbRun(
-    `INSERT INTO query_logs (agent_id, tool, params, latency_ms, status, error, project_id, input_size, output_size, compute_tokens, compute_model)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO query_logs (agent_id, tool, params, latency_ms, status, error, project_id, input_size, output_size, compute_tokens, tokens_saved, compute_model)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       agentId,
       body.tool || 'unknown',
@@ -29,6 +29,7 @@ metricsRouter.post('/query-log', apiKeyAuthMiddleware, async (c) => {
       body.inputSize || 0,
       body.outputSize || 0,
       body.computeTokens || 0,
+      body.tokensSaved || 0,
       body.computeModel || null,
     ],
   )
@@ -136,10 +137,23 @@ metricsRouter.get('/overview', jwtAuthMiddleware, async (c) => {
     `SELECT COUNT(*) as count FROM session_handoffs WHERE 1=1 ${kf}`,
     kp,
   )
+  // Pull both metrics in a single scan: actual compute usage and the
+  // estimated tokens saved by routing context through MCP. Both columns are
+  // populated by the producer (apps/corn-mcp/src/telemetry/estimate.ts).
+  // The kf filter (`agent_id IN (keyIds)`) keeps the result per-user; for
+  // non-admin with zero keys it collapses to 1=0 → all sums come back as 0.
   const toolCalls = await dbGet(
-    `SELECT COUNT(*) as count, COALESCE(SUM(compute_tokens), 0) as tokens FROM query_logs WHERE 1=1 ${kf}`,
+    `SELECT COUNT(*) as count,
+            COALESCE(SUM(compute_tokens), 0) as compute_tokens,
+            COALESCE(SUM(tokens_saved), 0) as tokens_saved
+     FROM query_logs WHERE 1=1 ${kf}`,
     kp,
   )
+
+  const totalCalls = Number(toolCalls?.['count'] || 0)
+  const totalCompute = Number(toolCalls?.['compute_tokens'] || 0)
+  const totalSaved = Number(toolCalls?.['tokens_saved'] || 0)
+  const avg = (n: number) => (totalCalls > 0 ? Math.round(n / totalCalls) : 0)
 
   return c.json({
     projects,
@@ -160,13 +174,15 @@ metricsRouter.get('/overview', jwtAuthMiddleware, async (c) => {
     organizations: orgsCount?.['count'] || 0,
     uptime: Math.floor(process.uptime()),
     tokenSavings: {
-      totalTokensSaved: toolCalls?.['tokens'] || 0,
-      totalToolCalls: toolCalls?.['count'] || 0,
-      avgTokensPerCall:
-        Number(toolCalls?.['count']) > 0
-          ? Math.round(Number(toolCalls?.['tokens'] || 0) / Number(toolCalls?.['count']))
-          : 0,
+      totalTokensSaved: totalSaved,
+      totalToolCalls: totalCalls,
+      avgTokensPerCall: avg(totalSaved),
       topTools: [],
+    },
+    tokenUsage: {
+      totalComputeTokens: totalCompute,
+      totalToolCalls: totalCalls,
+      avgTokensPerCall: avg(totalCompute),
     },
   })
 })

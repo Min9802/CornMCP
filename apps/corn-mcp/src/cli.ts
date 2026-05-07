@@ -67,6 +67,7 @@ loadEnv()
 async function run() {
   const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js')
   const { createMcpServer } = await import('./index.js')
+  const { estimateComputeTokens, estimateTokensSaved } = await import('./telemetry/estimate.js')
 
   interface Env {
     QDRANT_URL: string
@@ -109,6 +110,9 @@ async function run() {
 
       const latencyMs = Date.now() - req.start
       const status = message.error ? 'error' : 'ok'
+      const outputSize = JSON.stringify(message).length
+      const computeTokens = estimateComputeTokens(req.inputSize, outputSize)
+      const tokensSaved = status === 'ok' ? estimateTokensSaved(req.tool, outputSize) : 0
 
       const telemetryHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
       if (env.DASHBOARD_API_KEY) telemetryHeaders['X-API-Key'] = env.DASHBOARD_API_KEY
@@ -121,6 +125,9 @@ async function run() {
           status,
           latencyMs,
           inputSize: req.inputSize,
+          outputSize,
+          computeTokens,
+          tokensSaved,
         }),
       }).catch(() => {})
     }

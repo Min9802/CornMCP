@@ -30,10 +30,13 @@ analyticsRouter.get('/tool-analytics', async (c) => {
   if (agentId) { whereClause += ' AND agent_id = ?'; params.push(agentId) }
   if (projectId) { whereClause += ' AND project_id = ?'; params.push(projectId) }
 
+  // estimatedTokensSaved reads from tokens_saved (estimation produced by
+  // apps/corn-mcp/src/telemetry/estimate.ts), NOT compute_tokens which is
+  // the actual usage and would invert the meaning of the metric.
   const summary = await dbGet(
     `SELECT COUNT(*) as totalCalls,
             ROUND(100.0 * SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as overallSuccessRate,
-            COALESCE(SUM(compute_tokens), 0) as estimatedTokensSaved,
+            COALESCE(SUM(tokens_saved), 0) as estimatedTokensSaved,
             COALESCE(SUM(input_size + output_size), 0) as totalDataBytes,
             COUNT(DISTINCT agent_id) as activeAgents
      FROM query_logs ${whereClause}`,
