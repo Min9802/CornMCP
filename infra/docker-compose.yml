@@ -98,6 +98,8 @@ services:
     restart: unless-stopped
     ports:
       - "${MCP_PORT:-8317}:8317"
+    volumes:
+      - mcp-data:/app/data
     environment:
       PORT: 8317
       NODE_ENV: production
@@ -178,3 +180,5 @@ volumes:
     name: corn-qdrant-data
   api-data:
     name: corn-api-data
+  mcp-data:
+    name: corn-mcp-data
