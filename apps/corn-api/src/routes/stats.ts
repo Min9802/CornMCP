@@ -47,10 +47,14 @@ metricsRouter.get('/activity', jwtAuthMiddleware, async (c) => {
   const { user, keyIds } = getAuthCtx(c)
   const limit = Number(c.req.query('limit') || '20')
 
-  const keyFilter = user.role !== 'admin' && keyIds.length > 0
+  // Non-admin with zero keys must collapse to zero rows. query_logs has no
+  // user_id column, so dropping the filter would expose other tenants.
+  const keyFilter = user.role === 'admin'
+    ? ''
+    : keyIds.length > 0
     ? `AND agent_id IN (${keyIds.map(() => '?').join(',')})`
-    : ''
-  const keyParams = user.role !== 'admin' ? keyIds : []
+    : 'AND 1=0'
+  const keyParams = user.role !== 'admin' && keyIds.length > 0 ? keyIds : []
 
   const rows = await dbAll(
     `SELECT id, agent_id, tool, status, latency_ms, created_at
@@ -75,12 +79,14 @@ metricsRouter.get('/overview', jwtAuthMiddleware, async (c) => {
   const { user, keyIds, projectIds } = getAuthCtx(c)
   const isAdmin = user.role === 'admin'
 
-  const kf = !isAdmin && keyIds.length > 0
-    ? `AND agent_id IN (${keyIds.map(() => '?').join(',')})` : ''
-  const kp = !isAdmin ? keyIds : []
-  const pf = !isAdmin && projectIds.length > 0
-    ? `AND id IN (${projectIds.map(() => '?').join(',')})` : ''
-  const pp = !isAdmin ? projectIds : []
+  // Empty scope must mean zero rows for non-admin, otherwise the dashboard
+  // overview leaks every other user's queries / projects / quality reports.
+  const kf = isAdmin ? '' : keyIds.length > 0
+    ? `AND agent_id IN (${keyIds.map(() => '?').join(',')})` : 'AND 1=0'
+  const kp = !isAdmin && keyIds.length > 0 ? keyIds : []
+  const pf = isAdmin ? '' : projectIds.length > 0
+    ? `AND id IN (${projectIds.map(() => '?').join(',')})` : 'AND 1=0'
+  const pp = !isAdmin && projectIds.length > 0 ? projectIds : []
 
   const projects = await dbAll(`SELECT * FROM projects WHERE 1=1 ${pf}`, pp)
 
@@ -96,9 +102,9 @@ metricsRouter.get('/overview', jwtAuthMiddleware, async (c) => {
     kp,
   )
 
-  const qpf = !isAdmin && projectIds.length > 0
-    ? `AND project_id IN (${projectIds.map(() => '?').join(',')})` : ''
-  const qpp = !isAdmin ? projectIds : []
+  const qpf = isAdmin ? '' : projectIds.length > 0
+    ? `AND project_id IN (${projectIds.map(() => '?').join(',')})` : 'AND 1=0'
+  const qpp = !isAdmin && projectIds.length > 0 ? projectIds : []
 
   const lastQuality = await dbGet(
     `SELECT grade, score_total FROM quality_reports WHERE 1=1 ${qpf} ORDER BY created_at DESC LIMIT 1`,

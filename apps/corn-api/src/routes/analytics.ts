@@ -16,10 +16,16 @@ analyticsRouter.get('/tool-analytics', async (c) => {
   let whereClause = `WHERE created_at >= datetime('now', '-' || ? || ' days')`
   const params: unknown[] = [days]
 
-  // Scope to user's keys unless admin
-  if (user.role !== 'admin' && keyIds.length > 0) {
-    whereClause += ` AND agent_id IN (${keyIds.map(() => '?').join(',')})`
-    params.push(...keyIds)
+  // Scope to user's keys unless admin. If a non-admin has zero keys we must
+  // force the result set to empty — falling through with no filter would leak
+  // every other user's query logs (the agent_id column has no user_id FK).
+  if (user.role !== 'admin') {
+    if (keyIds.length === 0) {
+      whereClause += ' AND 1=0'
+    } else {
+      whereClause += ` AND agent_id IN (${keyIds.map(() => '?').join(',')})`
+      params.push(...keyIds)
+    }
   }
   if (agentId) { whereClause += ' AND agent_id = ?'; params.push(agentId) }
   if (projectId) { whereClause += ' AND project_id = ?'; params.push(projectId) }

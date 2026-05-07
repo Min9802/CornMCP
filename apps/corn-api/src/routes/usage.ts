@@ -9,10 +9,15 @@ usageRouter.get('/', jwtAuthMiddleware, async (c) => {
   const { user, keyIds } = getAuthCtx(c)
   const days = Number(c.req.query('days') || '30')
 
-  const keyFilter = user.role !== 'admin' && keyIds.length > 0
+  // Non-admin with zero keys must see zero rows — usage_logs has no user_id
+  // column, so the only scope handle is agent_id (= api_keys.id). Falling
+  // through with no filter would leak every other tenant's tokens.
+  const keyFilter = user.role === 'admin'
+    ? ''
+    : keyIds.length > 0
     ? `AND agent_id IN (${keyIds.map(() => '?').join(',')})`
-    : ''
-  const keyParams = user.role !== 'admin' ? keyIds : []
+    : 'AND 1=0'
+  const keyParams = user.role !== 'admin' && keyIds.length > 0 ? keyIds : []
 
   const totalTokens = await dbGet(
     `SELECT COALESCE(SUM(total_tokens), 0) as total, COUNT(*) as requests
