@@ -1,5 +1,6 @@
 import initSqlJs, { type Database, type SqlValue } from 'sql.js'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
+import { writeFile, rename } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createLogger } from '@corn/shared-utils'
@@ -8,6 +9,87 @@ const logger = createLogger('db')
 
 let db: Database | null = null
 let dbPath: string = ''
+
+// ── Debounced async persistence ──────────────────────────
+// Background: sql.js holds the DB in memory. Persisting historically meant
+// `writeFileSync(dbPath, db.export())` after every `dbRun`, which blocks the
+// event loop for the duration of a full ~MB-sized rewrite. Under bursty load
+// (many parallel POST /api/auth/validate-key, /api/metrics/query-log,
+// /api/sessions, ...) those fsyncs serialize and a single request can stall
+// past 5 s, tripping the MCP `AbortSignal.timeout(5000)` and surfacing as
+// `[mcp-auth] Failed to validate API key ... TimeoutError`.
+//
+// Strategy: mark dirty + schedule a single async writer per tick. Concurrent
+// writes coalesce into one `writeFile`. Atomic via tmp + rename so a crash
+// mid-write can't corrupt the live DB file.
+let dirty = false
+let saveScheduled = false
+let saveInFlight: Promise<void> | null = null
+
+function scheduleSave(): void {
+  dirty = true
+  if (saveScheduled) return
+  saveScheduled = true
+  setImmediate(() => {
+    saveScheduled = false
+    void runSave()
+  })
+}
+
+async function runSave(): Promise<void> {
+  if (saveInFlight) {
+    // Already draining — the in-flight loop will pick up our latest `dirty`.
+    await saveInFlight
+    return
+  }
+  saveInFlight = (async () => {
+    while (dirty && db && dbPath) {
+      // Snapshot first, then clear dirty. Any dbRun racing with us flips
+      // dirty back to true and the while-loop performs another iteration.
+      dirty = false
+      const data = db.export()
+      const buffer = Buffer.from(data)
+      const tmpPath = `${dbPath}.tmp`
+      try {
+        await writeFile(tmpPath, buffer)
+        await rename(tmpPath, dbPath)
+      } catch (err) {
+        logger.error('Failed to persist DB:', err)
+        dirty = true
+        // Back off so a persistent IO failure doesn't tight-loop.
+        await new Promise((r) => setTimeout(r, 250))
+      }
+    }
+  })().finally(() => {
+    saveInFlight = null
+  })
+  return saveInFlight
+}
+
+/** Wait until any pending or in-flight save completes. */
+export async function flushDb(): Promise<void> {
+  if (!dirty && !saveInFlight) return
+  // Make sure our latest dirty state is queued for a write.
+  scheduleSave()
+  while (dirty || saveInFlight) {
+    if (saveInFlight) {
+      await saveInFlight
+    } else {
+      // saveScheduled but setImmediate hasn't fired yet — yield once.
+      await new Promise((r) => setImmediate(r))
+    }
+  }
+}
+
+/** Synchronous flush — used by signal handlers / closeDb. */
+function flushDbSync(): void {
+  if (!db || !dbPath) return
+  if (!dirty && !saveScheduled && !saveInFlight) return
+  dirty = false
+  const data = db.export()
+  const buffer = Buffer.from(data)
+  writeFileSync(dbPath, buffer)
+}
 
 /**
  * Split a SQL script into individual statements, respecting:
@@ -186,7 +268,7 @@ export async function getDb(): Promise<Database> {
       }
     }
 
-    saveDb()
+    flushDbSync()
     logger.info(`Database initialized at ${dbPath}`)
   } catch (err) {
     logger.error('Failed to initialize database:', err)
@@ -196,17 +278,21 @@ export async function getDb(): Promise<Database> {
   return db
 }
 
+/**
+ * Synchronous save — kept for callers that need a guaranteed flush before
+ * returning (e.g. shutdown paths). Most write paths should rely on the
+ * debounced `scheduleSave` invoked from `dbRun`.
+ */
 export function saveDb(): void {
   if (db && dbPath) {
-    const data = db.export()
-    const buffer = Buffer.from(data)
-    writeFileSync(dbPath, buffer)
+    dirty = true
+    flushDbSync()
   }
 }
 
 export function closeDb(): void {
   if (db) {
-    saveDb()
+    flushDbSync()
     db.close()
     db = null
   }
@@ -232,11 +318,13 @@ export async function dbGet(sql: string, params: unknown[] = []): Promise<Record
   return rows[0]
 }
 
-// Helper to run an INSERT/UPDATE/DELETE
+// Helper to run an INSERT/UPDATE/DELETE.
+// The disk write is debounced — see `scheduleSave` above. Callers that need a
+// hard durability guarantee before returning should `await flushDb()` after.
 export async function dbRun(sql: string, params: unknown[] = []): Promise<void> {
   const database = await getDb()
   database.run(sql, params as SqlValue[])
-  saveDb()
+  scheduleSave()
 }
 
 export default getDb

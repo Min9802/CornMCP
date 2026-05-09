@@ -40,11 +40,16 @@ export async function validateApiKey(
   const apiUrl = (env.DASHBOARD_API_URL || process.env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
 
   try {
+    // 15s timeout: the Dashboard API persists sql.js to disk on every write
+    // and bursts of telemetry/session writes can briefly stall a single
+    // /api/auth/validate-key past a few seconds. 5s used to flap into 401s;
+    // 15s is well below any reasonable user perception threshold and keeps
+    // a hung api from blocking MCP forever.
     const res = await fetch(`${apiUrl}/api/auth/validate-key`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key }),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(15000),
     })
 
     const data = await res.json() as Record<string, unknown>

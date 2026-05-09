@@ -3,7 +3,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger as honoLogger } from 'hono/logger'
 import { createLogger } from '@corn/shared-utils'
-import { getDb } from './db/client.js'
+import { getDb, closeDb, flushDb } from './db/client.js'
 import { keysRouter } from './routes/keys.js'
 import { sessionsRouter } from './routes/sessions.js'
 import { qualityRouter } from './routes/quality.js'
@@ -138,9 +138,36 @@ async function start() {
     `Session auto-close enabled (timeout=${timeoutMinutes}m, check=${Math.round(checkIntervalMs / 1000)}s)`,
   )
 
-  serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, () => {
+  const server = serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, () => {
     logger.info(`🌽 Corn Dashboard API listening on http://0.0.0.0:${port}`)
   })
+
+  // ── Graceful shutdown ───────────────────────────────────
+  // The DB persist layer is debounced (see db/client.ts) so an unflushed
+  // write window exists between dbRun and disk commit. SIGTERM (sent by
+  // docker stop / compose down) and SIGINT must drain that window before we
+  // exit — otherwise the most recent writes are lost.
+  let shuttingDown = false
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return
+    shuttingDown = true
+    logger.info(`Received ${signal}, flushing DB and shutting down...`)
+    try {
+      await flushDb()
+    } catch (err) {
+      logger.error('Error flushing DB during shutdown:', err)
+    }
+    try {
+      closeDb()
+    } catch (err) {
+      logger.error('Error closing DB during shutdown:', err)
+    }
+    server.close(() => process.exit(0))
+    // Hard-fail safety: don't hang forever if HTTP sockets won't close.
+    setTimeout(() => process.exit(0), 5_000).unref()
+  }
+  process.on('SIGTERM', () => void shutdown('SIGTERM'))
+  process.on('SIGINT', () => void shutdown('SIGINT'))
 }
 
 start().catch((err) => {
