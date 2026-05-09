@@ -121,6 +121,20 @@ async function ensureProject(
   userId: string,
   hints?: { gitRepoUrl?: string; localPath?: string },
 ): Promise<string> {
+  // Diagnostic: warn when caller skips both dedupe hints. We can still resolve
+  // via fuzzy name match (B3) or create a new row, but any project created
+  // without a hint will have `git_repo_url IS NULL`, so future sessions for
+  // the same repo will keep missing B1/B2 and risk spawning duplicates.
+  // Update `.agent/workflows/rules_handoff_cornhub.md` step 2 if agents keep
+  // omitting these.
+  if (!hints?.gitRepoUrl && !hints?.localPath) {
+    console.warn(
+      `[ensureProject] No gitRepoUrl/localPath hint for project "${projectName}" (user=${userId}). ` +
+      `Falling back to fuzzy name match — risk of duplicate project on future sessions. ` +
+      `Agent should pass \`git remote get-url origin\` and absolute workspace path to corn_session_start.`,
+    )
+  }
+
   if (hints?.gitRepoUrl) {
     const found = await findProjectByGitUrl(userId, hints.gitRepoUrl)
     if (found) return found
