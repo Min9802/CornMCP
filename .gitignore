@@ -16,3 +16,5 @@ SESSION_HANDOFF.md
 SESSION_HANDOFF_archive_*.md
 PROJECT_CONTEXT.md
 .agent/workflows/rules_handoff_cornhub.md
+plan.*.md
+*_plan.md

@@ -13,7 +13,7 @@ services:
       - "6333:6333"   # REST API
       - "6334:6334"   # gRPC
     volumes:
-      - qdrant-data:/qdrant/storage
+      - ./qdrant-data:/qdrant/storage
     environment:
       QDRANT__SERVICE__GRPC_PORT: 6334
     deploy:
@@ -47,7 +47,7 @@ services:
     ports:
       - "${API_PORT:-6100}:4000"
     volumes:
-      - api-data:/app/data
+      - ./api-data:/app/data
     environment:
       PORT: 4000
       NODE_ENV: production
@@ -57,6 +57,8 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-changeme}
+      # S1 secrets layer master key (falls back to AUTH_JWT_SECRET when unset)
+      SYSTEM_SETTINGS_MASTER_KEY: ${SYSTEM_SETTINGS_MASTER_KEY:-}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
       # Email / OTP
       APP_NAME: ${APP_NAME:-Corn Hub}

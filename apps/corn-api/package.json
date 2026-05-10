@@ -7,7 +7,9 @@
     "dev": "tsx watch src/index.ts",
     "build": "npx tsc",
     "start": "node dist/index.js",
-    "typecheck": "npx tsc --noEmit"
+    "typecheck": "npx tsc --noEmit",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "migrate:encrypt-keys": "tsx scripts/migrate-encrypt-keys.ts"
   },
   "dependencies": {
     "@corn/shared-mem9": "workspace:*",
