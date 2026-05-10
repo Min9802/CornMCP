@@ -1,9 +1,23 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import type { McpEnv } from '@corn/shared-types'
-import { LocalMem9Service, OpenAIEmbeddingProvider, LocalHashEmbeddingProvider } from '@corn/shared-mem9'
+import { Mem9Service, OpenAIEmbeddingProvider, LocalHashEmbeddingProvider } from '@corn/shared-mem9'
 import type { EmbeddingProvider } from '@corn/shared-mem9'
 import { generateId } from '@corn/shared-utils'
+import { runTask } from '../services/task-dispatcher.js'
+import {
+  AUTO_TAGS_TASK_NAME,
+  registerAutoTagsTask,
+  type AutoTagsInput,
+  type AutoTagsResult,
+} from './auto-tags.js'
+import {
+  MEMORY_DEDUP_TASK_NAME,
+  registerDedupTasks,
+  type DedupCandidate,
+  type DedupInput,
+  type DedupResult,
+} from './dedup.js'
 
 function apiHeaders(env: McpEnv): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -11,7 +25,7 @@ function apiHeaders(env: McpEnv): Record<string, string> {
   return h
 }
 
-let mem9: LocalMem9Service | null = null
+let mem9: Mem9Service | null = null
 let usingFallback = false
 
 async function createEmbedder(): Promise<EmbeddingProvider> {
@@ -44,20 +58,34 @@ async function createEmbedder(): Promise<EmbeddingProvider> {
   return new LocalHashEmbeddingProvider(256)
 }
 
-let initPromise: Promise<LocalMem9Service> | null = null
+let initPromise: Promise<Mem9Service> | null = null
 
-function getMem9(env: McpEnv): Promise<LocalMem9Service> {
+function getMem9(env: McpEnv): Promise<Mem9Service> {
   if (mem9) return Promise.resolve(mem9)
   if (!initPromise) {
-    initPromise = createEmbedder().then((embedder) => {
-      mem9 = new LocalMem9Service(embedder, './data/mem9-vectors.db')
-      return mem9
+    initPromise = createEmbedder().then(async (embedder) => {
+      const qdrantUrl = env.QDRANT_URL || process.env['QDRANT_URL'] || 'http://localhost:6333'
+      const svc = new Mem9Service(qdrantUrl, embedder)
+      // ensureCollection is idempotent (probes GET /collections/:name first),
+      // so this is safe to call on every cold start. Required because Qdrant
+      // returns 404 for first-time upsert without an existing collection.
+      await svc.init()
+      mem9 = svc
+      return svc
     })
   }
   return initPromise
 }
 
 export function registerMemoryTools(server: McpServer, env: McpEnv) {
+  // Wire the auto-tag task with the dispatcher. Idempotent — knowledge.ts
+  // calls the same helper, last write wins with identical refs so the
+  // ordering between registerMemoryTools / registerKnowledgeTools is moot.
+  registerAutoTagsTask()
+  // Dedup tasks share the same helper across memory + knowledge. Safe to
+  // call from both registry entry points.
+  registerDedupTasks()
+
   // ─── Store Memory ────────────────────────────────────
   server.tool(
     'corn_memory_store',
@@ -69,18 +97,90 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
         .min(1)
         .describe('REQUIRED. Project scope for the memory (e.g. proj-xxx). Memories are isolated per project. Use corn_knowledge_store for cross-project items.'),
       branch: z.string().optional().describe('Git branch scope'),
-      tags: z.array(z.string()).optional().describe('Tags for categorization (e.g. ["session-log", "<feature>"])'),
+      tags: z.array(z.string()).optional().describe('Tags for categorization (e.g. ["session-log", "<feature>"]). If omitted or empty, the server auto-suggests tags from the content (heuristic by default; LLM mode toggleable in admin UI).'),
     },
     async ({ content, projectId, branch, tags }) => {
       const svc = await getMem9(env)
       const id = generateId('mem')
       const agentId = (env as McpEnv & { API_KEY_OWNER?: string }).API_KEY_OWNER || 'unknown'
 
+      // ── Dedup pre-check ──
+      // Vector-search top-3 similar memories scoped to the project, then
+      // ask the dispatcher (heuristic by default, LLM when admin opts in)
+      // whether the incoming content is effectively a duplicate. Best-
+      // effort: any failure → continue with normal store path. Better to
+      // write a possible duplicate than to silently drop a legit memory.
+      let dedupNote = ''
+      try {
+        const candidates = await svc.searchMemory(
+          content,
+          3,
+          projectId ? { project_id: projectId } : undefined,
+        )
+        if (candidates.length > 0) {
+          const { result, metadata } = await runTask<DedupInput, DedupResult>(
+            MEMORY_DEDUP_TASK_NAME,
+            {
+              content,
+              candidates: candidates.map<DedupCandidate>((c) => ({
+                id: c.id,
+                content: (c.payload?.['content'] as string) ?? '',
+                score: c.score,
+              })),
+            },
+            env,
+          )
+          if (result.isDuplicate) {
+            const fallback = metadata.fellBack ? ', fallback' : ''
+            const target = result.duplicateOfId ? ` of ${result.duplicateOfId}` : ''
+            const reason = result.reason ? ` — ${result.reason}` : ''
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `🔁 Skipped duplicate memory${target} (${metadata.engineUsed}${fallback})${reason}\n\nNo new memory stored. Pass explicit tags or different wording to override.`,
+                },
+              ],
+            }
+          }
+          if (metadata.fellBack) {
+            dedupNote = `\n🛈 Dedup fell back to heuristic (${metadata.llmError ?? 'llm error'})`
+          }
+        }
+      } catch {
+        // Silent: dedup failure must not block store. User can always
+        // search after the fact to find duplicates.
+      }
+
+      // Auto-tag only when caller did not supply any tags. Explicit empty
+      // arrays still trigger auto-tag (treated as "no tags yet, please
+      // suggest"); pass at least one explicit tag to opt out entirely.
+      // Best-effort: any error → keep original `tags`, never block store.
+      let finalTags = tags ?? []
+      let autoTagNote = ''
+      if (finalTags.length === 0) {
+        try {
+          const { result, metadata } = await runTask<AutoTagsInput, AutoTagsResult>(
+            AUTO_TAGS_TASK_NAME,
+            { content },
+            env,
+          )
+          if (result.tags.length > 0) {
+            finalTags = result.tags
+            const fallback = metadata.fellBack ? ', fallback' : ''
+            autoTagNote = `\n🏷 Auto-tagged: ${result.tags.join(', ')} (${metadata.engineUsed}${fallback})`
+          }
+        } catch {
+          // Silent: registry mis-config or both engines failed → store
+          // memory with empty tags. User can search by content + branch.
+        }
+      }
+
       await svc.storeMemory(id, content, {
         agent_id: agentId,
         project_id: projectId,
         branch: branch || null,
-        tags: tags || [],
+        tags: finalTags,
       })
 
       // Best-effort: register a preview row in Dashboard API so the web UI
@@ -97,7 +197,7 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
             agentId,
             projectId,
             branch: branch || null,
-            tags: tags || [],
+            tags: finalTags,
           }),
           signal: AbortSignal.timeout(5000),
         })
@@ -109,7 +209,7 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
         content: [
           {
             type: 'text' as const,
-            text: `✅ Memory stored (id: ${id}, project: ${projectId})\n\nContent: "${content.slice(0, 100)}${content.length > 100 ? '...' : ''}"`,
+            text: `✅ Memory stored (id: ${id}, project: ${projectId})\n\nContent: "${content.slice(0, 100)}${content.length > 100 ? '...' : ''}"${autoTagNote}${dedupNote}`,
           },
         ],
       }

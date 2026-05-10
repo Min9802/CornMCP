@@ -1,7 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import type { McpEnv } from '@corn/shared-types'
-import { SQLiteVectorStore } from '@corn/shared-mem9'
 
 export function registerHealthTools(server: McpServer, env: McpEnv) {
   server.tool(
@@ -11,25 +10,22 @@ export function registerHealthTools(server: McpServer, env: McpEnv) {
     async () => {
       const services: Record<string, string> = {}
 
-      // Check local vector store
+      // Check Qdrant — primary vector store. Memory + knowledge tools depend
+      // on this being reachable; a failure here means corn_memory_* and
+      // corn_knowledge_* will surface upstream errors. Mirror to vectorStore
+      // for backward-compat dashboards that still read the old field.
+      const qdrantUrl = env.QDRANT_URL || process.env['QDRANT_URL'] || 'http://localhost:6333'
+      let qdrantOk = false
       try {
-        const store = new SQLiteVectorStore('./data/mem9-vectors.db')
-        const ok = await store.health()
-        services.vectorStore = ok ? 'ok' : 'error'
-      } catch {
-        services.vectorStore = 'error'
-      }
-
-      // Check Qdrant (optional — may not be running)
-      try {
-        const qdrantUrl = env.QDRANT_URL || 'http://localhost:6333'
         const res = await fetch(`${qdrantUrl}/healthz`, {
           signal: AbortSignal.timeout(2000),
         })
-        services.qdrant = res.ok ? 'ok' : 'unavailable'
+        qdrantOk = res.ok
+        services.qdrant = res.ok ? 'ok' : 'error'
       } catch {
-        services.qdrant = 'unavailable (not required)'
+        services.qdrant = 'error'
       }
+      services.vectorStore = qdrantOk ? 'ok' : 'error'
 
       // Check Dashboard API
       try {
@@ -68,7 +64,7 @@ export function registerHealthTools(server: McpServer, env: McpEnv) {
       services.embeddingProvider = embeddingStatus
       const hasApiKey = embeddingStatus === 'ok'
 
-      const coreOk = services.vectorStore === 'ok' && services.api === 'ok' && hasApiKey
+      const coreOk = qdrantOk && services.api === 'ok' && hasApiKey
 
       return {
         content: [

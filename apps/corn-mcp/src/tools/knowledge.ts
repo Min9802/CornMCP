@@ -1,9 +1,23 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import type { McpEnv } from '@corn/shared-types'
-import { LocalMem9Service, OpenAIEmbeddingProvider, LocalHashEmbeddingProvider } from '@corn/shared-mem9'
+import { Mem9Service, OpenAIEmbeddingProvider, LocalHashEmbeddingProvider } from '@corn/shared-mem9'
 import type { EmbeddingProvider } from '@corn/shared-mem9'
 import { generateId } from '@corn/shared-utils'
+import { runTask } from '../services/task-dispatcher.js'
+import {
+  AUTO_TAGS_TASK_NAME,
+  registerAutoTagsTask,
+  type AutoTagsInput,
+  type AutoTagsResult,
+} from './auto-tags.js'
+import {
+  KNOWLEDGE_DEDUP_TASK_NAME,
+  registerDedupTasks,
+  type DedupCandidate,
+  type DedupInput,
+  type DedupResult,
+} from './dedup.js'
 
 function apiHeaders(env: McpEnv): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -11,7 +25,7 @@ function apiHeaders(env: McpEnv): Record<string, string> {
   return h
 }
 
-let mem9: LocalMem9Service | null = null
+let mem9: Mem9Service | null = null
 
 async function createEmbedder(): Promise<EmbeddingProvider> {
   const apiKey = process.env['OPENAI_API_KEY'] || ''
@@ -38,20 +52,34 @@ async function createEmbedder(): Promise<EmbeddingProvider> {
   return new LocalHashEmbeddingProvider(256)
 }
 
-let initPromise: Promise<LocalMem9Service> | null = null
+let initPromise: Promise<Mem9Service> | null = null
 
-function getMem9(env: McpEnv): Promise<LocalMem9Service> {
+function getMem9(env: McpEnv): Promise<Mem9Service> {
   if (mem9) return Promise.resolve(mem9)
   if (!initPromise) {
-    initPromise = createEmbedder().then((embedder) => {
-      mem9 = new LocalMem9Service(embedder, './data/mem9-vectors.db')
-      return mem9
+    initPromise = createEmbedder().then(async (embedder) => {
+      const qdrantUrl = env.QDRANT_URL || process.env['QDRANT_URL'] || 'http://localhost:6333'
+      const svc = new Mem9Service(qdrantUrl, embedder)
+      // ensureCollection is idempotent (probes GET /collections/:name first),
+      // so this is safe to call on every cold start. Required because Qdrant
+      // returns 404 for first-time upsert without an existing collection.
+      await svc.init()
+      mem9 = svc
+      return svc
     })
   }
   return initPromise
 }
 
 export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
+  // Wire the auto-tag task with the dispatcher. Idempotent — memory.ts
+  // calls the same helper, last write wins with identical refs.
+  registerAutoTagsTask()
+  // Dedup tasks: shared module handles both memory + knowledge. Calling
+  // here as well is idempotent and defends against knowledge tools
+  // being registered before memory tools.
+  registerDedupTasks()
+
   // ─── Store Knowledge ─────────────────────────────────
   server.tool(
     'corn_knowledge_store',
@@ -60,19 +88,90 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
       title: z.string().describe('Title of the knowledge item'),
       content: z.string().describe('The knowledge content'),
       projectId: z.string().optional().describe('Associated project'),
-      tags: z.array(z.string()).optional().describe('Tags for categorization'),
+      tags: z.array(z.string()).optional().describe('Tags for categorization. If omitted or empty, the server auto-suggests tags from title + content (heuristic by default; LLM mode toggleable in admin UI).'),
     },
     async ({ title, content, projectId, tags }) => {
       const svc = await getMem9(env)
       const id = generateId('kb')
       const agentId = (env as McpEnv & { API_KEY_OWNER?: string }).API_KEY_OWNER || 'unknown'
 
-      // Store locally with SQLite vector search
+      // ── Dedup pre-check ──
+      // Same pattern as corn_memory_store but against the knowledge
+      // collection. Title + content form the search corpus so near-
+      // identical articles collide even when one copy stripped the title.
+      // Best-effort: failure never blocks the write.
+      const dedupCorpus = title ? `${title}\n\n${content}` : content
+      let dedupNote = ''
+      try {
+        const candidates = await svc.searchKnowledge(
+          dedupCorpus,
+          3,
+          projectId ? { project_id: projectId } : undefined,
+        )
+        if (candidates.length > 0) {
+          const { result, metadata } = await runTask<DedupInput, DedupResult>(
+            KNOWLEDGE_DEDUP_TASK_NAME,
+            {
+              content: dedupCorpus,
+              candidates: candidates.map<DedupCandidate>((c) => ({
+                id: c.id,
+                content: (c.payload?.['content'] as string) ?? '',
+                score: c.score,
+              })),
+            },
+            env,
+          )
+          if (result.isDuplicate) {
+            const fallback = metadata.fellBack ? ', fallback' : ''
+            const target = result.duplicateOfId ? ` of ${result.duplicateOfId}` : ''
+            const reason = result.reason ? ` — ${result.reason}` : ''
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `🔁 Skipped duplicate knowledge${target} (${metadata.engineUsed}${fallback})${reason}\n\nNo new document stored. Retitle or add net-new info to override.`,
+                },
+              ],
+            }
+          }
+          if (metadata.fellBack) {
+            dedupNote = ` (dedup fell back to heuristic)`
+          }
+        }
+      } catch {
+        // Silent: dedup failure must not block store.
+      }
+
+      // Auto-tag only when caller did not supply any tags. Title is
+      // included in the corpus to bias toward topical tags. Best-effort:
+      // any error → keep original `tags`, never block store.
+      let finalTags = tags ?? []
+      let autoTagNote = ''
+      if (finalTags.length === 0) {
+        try {
+          const corpus = title ? `${title}\n\n${content}` : content
+          const { result, metadata } = await runTask<AutoTagsInput, AutoTagsResult>(
+            AUTO_TAGS_TASK_NAME,
+            { content: corpus },
+            env,
+          )
+          if (result.tags.length > 0) {
+            finalTags = result.tags
+            const fallback = metadata.fellBack ? ', fallback' : ''
+            autoTagNote = ` (auto-tagged ${metadata.engineUsed}${fallback})`
+          }
+        } catch {
+          // Silent: registry mis-config or both engines failed → store
+          // knowledge with empty tags. User can search by content.
+        }
+      }
+
+      // Store in Qdrant vector store (corn_knowledge collection)
       await svc.storeKnowledge(id, content, {
         title,
         agent_id: agentId,
         project_id: projectId || null,
-        tags: tags || [],
+        tags: finalTags,
         source: 'agent',
       })
 
@@ -89,7 +188,7 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
             source: 'agent',
             sourceAgentId: agentId,
             projectId: projectId || null,
-            tags: tags || [],
+            tags: finalTags,
           }),
           signal: AbortSignal.timeout(5000),
         })
@@ -101,7 +200,7 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
         content: [
           {
             type: 'text' as const,
-            text: `✅ Knowledge stored: "${title}" (id: ${id})\n\nTags: ${(tags || []).join(', ') || 'none'}`,
+            text: `✅ Knowledge stored: "${title}" (id: ${id})\n\nTags: ${finalTags.join(', ') || 'none'}${autoTagNote}${dedupNote}`,
           },
         ],
       }
