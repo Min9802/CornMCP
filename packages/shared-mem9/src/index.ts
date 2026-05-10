@@ -2,6 +2,7 @@ import { createLogger } from '@corn/shared-utils'
 import initSqlJs, { type Database } from 'sql.js'
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { dirname } from 'path'
+import { createHash } from 'crypto'
 
 const logger = createLogger('mem9')
 
@@ -17,6 +18,37 @@ interface QdrantSearchResult {
   id: string
   score: number
   payload: Record<string, unknown>
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * Convert any caller-supplied string id (e.g. `mem-<hex32>`) into a Qdrant-
+ * accepted point id (UUID). Qdrant rejects arbitrary strings — only
+ * unsigned ints or RFC4122 UUIDs are valid. We hash the raw id with SHA-1
+ * and format the first 16 bytes as a UUIDv5-style identifier so the mapping
+ * is deterministic (idempotent re-runs / re-stores) while preserving the
+ * original id via `_id_raw` in the payload for round-trip on search.
+ *
+ * Already-formatted UUID inputs are passed through unchanged so the helper
+ * is forward-compatible with callers that adopt UUIDs natively.
+ */
+export function toQdrantPointId(rawId: string): string {
+  if (UUID_RE.test(rawId)) return rawId.toLowerCase()
+  const hash = createHash('sha1').update(rawId).digest('hex')
+  const verNibble = '5' + hash.slice(13, 16) // version=5
+  const variantByte = (
+    (parseInt(hash.slice(16, 18), 16) & 0x3f) | 0x80
+  ) // variant=10xx
+    .toString(16)
+    .padStart(2, '0')
+  return [
+    hash.slice(0, 8),
+    hash.slice(8, 12),
+    verNibble,
+    variantByte + hash.slice(18, 20),
+    hash.slice(20, 32),
+  ].join('-')
 }
 
 export class QdrantClient {
@@ -48,10 +80,18 @@ export class QdrantClient {
   }
 
   async upsert(collection: string, points: QdrantPoint[]): Promise<void> {
+    // Map caller ids → Qdrant-accepted UUIDs while preserving the raw id
+    // in the payload (`_id_raw`) so search results can round-trip back to
+    // the original identifier callers persist in their dashboards.
+    const wirePoints = points.map((p) => ({
+      id: toQdrantPointId(p.id),
+      vector: p.vector,
+      payload: { ...p.payload, _id_raw: p.id },
+    }))
     const res = await fetch(`${this.baseUrl}/collections/${collection}/points`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ points }),
+      body: JSON.stringify({ points: wirePoints }),
     })
     if (!res.ok) {
       const text = await res.text()
@@ -82,14 +122,21 @@ export class QdrantClient {
       throw new Error(`Qdrant search failed: ${text}`)
     }
     const data = (await res.json()) as { result: QdrantSearchResult[] }
-    return data.result
+    // Restore caller-facing ids from `_id_raw` (set by upsert). Older
+    // points without `_id_raw` fall back to the on-wire UUID so searches
+    // never throw mid-rollout.
+    return data.result.map((r) => ({
+      id: typeof r.payload?.['_id_raw'] === 'string' ? (r.payload['_id_raw'] as string) : r.id,
+      score: r.score,
+      payload: r.payload,
+    }))
   }
 
   async delete(collection: string, ids: string[]): Promise<void> {
     await fetch(`${this.baseUrl}/collections/${collection}/points/delete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ points: ids }),
+      body: JSON.stringify({ points: ids.map(toQdrantPointId) }),
     })
   }
 
