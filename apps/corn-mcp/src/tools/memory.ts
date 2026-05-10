@@ -186,9 +186,10 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
       // Best-effort: register a preview row in Dashboard API so the web UI
       // can list/audit/delete memories. Failure here must not break the MCP
       // tool — the canonical vector data is already persisted locally above.
+      // Errors are logged so missing dashboard rows can be diagnosed.
       try {
         const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
-        await fetch(`${apiUrl}/api/memories`, {
+        const res = await fetch(`${apiUrl}/api/memories`, {
           method: 'POST',
           headers: apiHeaders(env),
           body: JSON.stringify({
@@ -201,8 +202,15 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
           }),
           signal: AbortSignal.timeout(5000),
         })
-      } catch {
-        // Dashboard API registration is best-effort
+        if (!res.ok) {
+          const body = await res.text().catch(() => '<unreadable>')
+          console.warn(
+            `[corn-mcp] dashboard sync /api/memories HTTP ${res.status} (id=${id}, project=${projectId}): ${body.slice(0, 200)}`,
+          )
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.warn(`[corn-mcp] dashboard sync /api/memories network error (id=${id}): ${msg}`)
       }
 
       return {

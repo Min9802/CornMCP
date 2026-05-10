@@ -54,10 +54,10 @@ export function registerQualityTools(server: McpServer, env: McpEnv) {
       const { grade, emoji, label } = gradeInfo(total)
       const passed = total >= 60
 
-      // Submit to Dashboard API
+      // Submit to Dashboard API (best-effort with diagnostic logging).
       try {
         const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
-        await fetch(`${apiUrl}/api/quality`, {
+        const res = await fetch(`${apiUrl}/api/quality`, {
           method: 'POST',
           headers: apiHeaders(env),
           body: JSON.stringify({
@@ -77,8 +77,15 @@ export function registerQualityTools(server: McpServer, env: McpEnv) {
           }),
           signal: AbortSignal.timeout(5000),
         })
-      } catch {
-        // Best effort
+        if (!res.ok) {
+          const body = await res.text().catch(() => '<unreadable>')
+          console.warn(
+            `[corn-mcp] dashboard sync /api/quality HTTP ${res.status} (id=${reportId}, project=${projectId || 'none'}): ${body.slice(0, 200)}`,
+          )
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.warn(`[corn-mcp] dashboard sync /api/quality network error (id=${reportId}): ${msg}`)
       }
 
       // ── Build rich table output ──

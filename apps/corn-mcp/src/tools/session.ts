@@ -42,10 +42,10 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
       const sessionId = generateId('ses')
       const agentId = (env as McpEnv & { API_KEY_OWNER?: string }).API_KEY_OWNER || 'unknown'
 
-      // Register session with Dashboard API
+      // Register session with Dashboard API (best-effort with diagnostic logging).
       try {
         const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
-        await fetch(`${apiUrl}/api/sessions`, {
+        const res = await fetch(`${apiUrl}/api/sessions`, {
           method: 'POST',
           headers: apiHeaders(env),
           body: JSON.stringify({
@@ -60,8 +60,15 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
           }),
           signal: AbortSignal.timeout(5000),
         })
-      } catch {
-        // Best effort
+        if (!res.ok) {
+          const body = await res.text().catch(() => '<unreadable>')
+          console.warn(
+            `[corn-mcp] dashboard sync /api/sessions HTTP ${res.status} (id=${sessionId}, project=${project}): ${body.slice(0, 200)}`,
+          )
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.warn(`[corn-mcp] dashboard sync /api/sessions network error (id=${sessionId}): ${msg}`)
       }
 
       return {
@@ -114,10 +121,10 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
         }
       }
 
-      // Update session in Dashboard API
+      // Update session in Dashboard API (best-effort with diagnostic logging).
       try {
         const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
-        await fetch(`${apiUrl}/api/sessions/${sessionId}`, {
+        const res = await fetch(`${apiUrl}/api/sessions/${sessionId}`, {
           method: 'PATCH',
           headers: apiHeaders(env),
           body: JSON.stringify({
@@ -130,8 +137,15 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
           }),
           signal: AbortSignal.timeout(5000),
         })
-      } catch {
-        // Best effort
+        if (!res.ok) {
+          const body = await res.text().catch(() => '<unreadable>')
+          console.warn(
+            `[corn-mcp] dashboard sync PATCH /api/sessions HTTP ${res.status} (id=${sessionId}): ${body.slice(0, 200)}`,
+          )
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.warn(`[corn-mcp] dashboard sync PATCH /api/sessions network error (id=${sessionId}): ${msg}`)
       }
 
       const parts = [`✅ Session ${sessionId} completed`, `\nSummary: ${finalSummary}`]

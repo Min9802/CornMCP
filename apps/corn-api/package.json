@@ -11,7 +11,8 @@
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "migrate:encrypt-keys": "tsx scripts/migrate-encrypt-keys.ts",
     "init-mongo": "tsx scripts/init-mongo.ts",
-    "migrate:sqlite-to-mongo": "tsx scripts/migrate-sqlite-to-mongo.ts"
+    "migrate:sqlite-to-mongo": "tsx scripts/migrate-sqlite-to-mongo.ts",
+    "backfill:memory-from-qdrant": "tsx scripts/backfill-memory-from-qdrant.ts"
   },
   "dependencies": {
     "@corn/shared-mem9": "workspace:*",

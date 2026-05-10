@@ -175,10 +175,12 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
         source: 'agent',
       })
 
-      // Also register in Dashboard API if available
+      // Also register in Dashboard API if available. Errors are logged
+      // so missing dashboard rows can be diagnosed; vector data above is
+      // canonical and stays consistent regardless.
       try {
         const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
-        await fetch(`${apiUrl}/api/knowledge`, {
+        const res = await fetch(`${apiUrl}/api/knowledge`, {
           method: 'POST',
           headers: apiHeaders(env),
           body: JSON.stringify({
@@ -192,8 +194,15 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
           }),
           signal: AbortSignal.timeout(5000),
         })
-      } catch {
-        // Dashboard API registration is best-effort
+        if (!res.ok) {
+          const body = await res.text().catch(() => '<unreadable>')
+          console.warn(
+            `[corn-mcp] dashboard sync /api/knowledge HTTP ${res.status} (id=${id}, project=${projectId || 'none'}): ${body.slice(0, 200)}`,
+          )
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.warn(`[corn-mcp] dashboard sync /api/knowledge network error (id=${id}): ${msg}`)
       }
 
       return {
