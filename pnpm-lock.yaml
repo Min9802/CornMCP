@@ -91,6 +91,12 @@ importers:
         specifier: ^3.24.0
         version: 3.25.76
     devDependencies:
+      '@types/sql.js':
+        specifier: ^1.4.10
+        version: 1.4.10
+      sql.js:
+        specifier: ^1.12.0
+        version: 1.14.1
       tsx:
         specifier: ^4.19.0
         version: 4.21.0

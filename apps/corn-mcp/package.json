@@ -10,7 +10,9 @@
     "dev": "tsx watch src/node.ts",
     "build": "npx tsc",
     "start": "node dist/node.js",
-    "typecheck": "npx tsc --noEmit"
+    "typecheck": "npx tsc --noEmit",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "migrate:sqlite-to-qdrant": "tsx scripts/migrate-sqlite-to-qdrant.ts"
   },
   "dependencies": {
     "@corn/shared-types": "workspace:*",
@@ -22,6 +24,8 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@types/sql.js": "^1.4.10",
+    "sql.js": "^1.12.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   }
