@@ -1,8 +1,8 @@
 import { type Context, type MiddlewareHandler } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { jwtVerify, SignJWT } from 'jose'
-import { dbAll, dbGet } from '../db/client.js'
 import { hashApiKey } from '@corn/shared-utils'
+import { ApiKey, Organization, Project, User } from '../db/mongoose/index.js'
 
 export interface AuthUser {
   id: string
@@ -55,23 +55,33 @@ export function getAgentCtx(c: Context) {
   }
 }
 
+// Resolve the API keys + projects this user can act on. The original SQL
+// used a single JOIN against organizations.user_id to find projects in
+// the user's orgs; in Mongo we issue two queries (orgs by user_id, then
+// projects by org_id list). Cardinality is small enough that the round
+// trip cost is negligible.
 async function loadUserScope(c: Context, userId: string, role: string) {
   if (role === 'admin') {
-    const allKeys = await dbAll('SELECT id FROM api_keys')
-    const allProjects = await dbAll('SELECT id FROM projects')
-    ;(c as any).set('userKeyIds', allKeys.map((k) => k['id'] as string))
-    ;(c as any).set('userProjectIds', allProjects.map((p) => p['id'] as string))
-  } else {
-    const keys = await dbAll('SELECT id FROM api_keys WHERE user_id = ?', [userId])
-    const projects = await dbAll(
-      `SELECT p.id FROM projects p
-       JOIN organizations o ON p.org_id = o.id
-       WHERE o.user_id = ?`,
-      [userId],
-    )
-    ;(c as any).set('userKeyIds', keys.map((k) => k['id'] as string))
-    ;(c as any).set('userProjectIds', projects.map((p) => p['id'] as string))
+    const [allKeys, allProjects] = await Promise.all([
+      ApiKey.find({}, { _id: 1 }).lean(),
+      Project.find({}, { _id: 1 }).lean(),
+    ])
+    ;(c as any).set('userKeyIds', allKeys.map((k) => k._id))
+    ;(c as any).set('userProjectIds', allProjects.map((p) => p._id))
+    return
   }
+
+  const orgs = await Organization.find({ user_id: userId }, { _id: 1 }).lean()
+  const orgIds = orgs.map((o) => o._id)
+
+  const [keys, projects] = await Promise.all([
+    ApiKey.find({ user_id: userId }, { _id: 1 }).lean(),
+    orgIds.length > 0
+      ? Project.find({ org_id: { $in: orgIds } }, { _id: 1 }).lean()
+      : Promise.resolve([] as { _id: string }[]),
+  ])
+  ;(c as any).set('userKeyIds', keys.map((k) => k._id))
+  ;(c as any).set('userProjectIds', projects.map((p) => p._id))
 }
 
 // ── JWT middleware (for dashboard routes) ─────────────────
@@ -92,38 +102,36 @@ export const adminOnly: MiddlewareHandler = async (c, next) => {
   await next()
 }
 
+// Resolve every project visible to a given API-key holder.
+// Same two-query strategy as loadUserScope() above.
+async function loadAgentProjectIds(agentUserId: string): Promise<string[]> {
+  const orgs = await Organization.find({ user_id: agentUserId }, { _id: 1 }).lean()
+  const orgIds = orgs.map((o) => o._id)
+  if (orgIds.length === 0) return []
+  const projects = await Project.find({ org_id: { $in: orgIds } }, { _id: 1 }).lean()
+  return projects.map((p) => p._id)
+}
+
 // ── API Key middleware (for agent write routes) ───────────
 export const apiKeyAuthMiddleware: MiddlewareHandler = async (c, next) => {
   const rawKey = c.req.header('X-API-Key') || c.req.header('x-api-key')
   if (!rawKey) return c.json({ error: 'API key required (X-API-Key header)' }, 401)
 
   const keyHash = hashApiKey(rawKey)
-  const keyRow = await dbGet(
-    'SELECT id, user_id FROM api_keys WHERE key_hash = ?',
-    [keyHash],
-  )
+  const keyRow = await ApiKey.findOne({ key_hash: keyHash }, { _id: 1, user_id: 1 }).lean()
   if (!keyRow) return c.json({ error: 'Invalid API key' }, 401)
 
-  const agentUserId = keyRow['user_id'] as string | null
-  ;(c as any).set('agentKeyId', keyRow['id'] as string)
+  const agentUserId = keyRow.user_id ?? null
+  ;(c as any).set('agentKeyId', keyRow._id)
   ;(c as any).set('agentUserId', agentUserId)
 
-  if (agentUserId) {
-    const projects = await dbAll(
-      `SELECT p.id FROM projects p
-       JOIN organizations o ON p.org_id = o.id
-       WHERE o.user_id = ?`,
-      [agentUserId],
-    )
-    ;(c as any).set('agentUserProjectIds', projects.map((p) => p['id'] as string))
-  } else {
-    ;(c as any).set('agentUserProjectIds', [])
-  }
+  const projectIds = agentUserId ? await loadAgentProjectIds(agentUserId) : []
+  ;(c as any).set('agentUserProjectIds', projectIds)
 
-  // Update last_used_at
-  await import('../db/client.js').then(({ dbRun }) =>
-    dbRun(`UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?`, [keyRow['id'] as string]),
-  )
+  // Update last_used_at — fire and forget so the request doesn't wait
+  // for the audit write to land.
+  void ApiKey.updateOne({ _id: keyRow._id }, { $set: { last_used_at: new Date() } })
+
   await next()
 }
 
@@ -146,33 +154,32 @@ export const anyAuthMiddleware: MiddlewareHandler = async (c, next) => {
   const rawKey = c.req.header('X-API-Key') || c.req.header('x-api-key')
   if (rawKey) {
     const keyHash = hashApiKey(rawKey)
-    const keyRow = await dbGet('SELECT id, user_id FROM api_keys WHERE key_hash = ?', [keyHash])
+    const keyRow = await ApiKey.findOne({ key_hash: keyHash }, { _id: 1, user_id: 1 }).lean()
     if (keyRow) {
-      const agentUserId = keyRow['user_id'] as string | null
-      ;(c as any).set('agentKeyId', keyRow['id'] as string)
+      const agentUserId = keyRow.user_id ?? null
+      ;(c as any).set('agentKeyId', keyRow._id)
       ;(c as any).set('agentUserId', agentUserId)
       ;(c as any).set('authSource', 'apikey')
 
       if (agentUserId) {
         // Load user profile so getAuthCtx() works transparently
-        const userRow = await dbGet('SELECT id, email, name, role FROM users WHERE id = ?', [agentUserId])
+        const userRow = await User.findById(agentUserId, {
+          _id: 1,
+          email: 1,
+          name: 1,
+          role: 1,
+        }).lean()
         if (userRow) {
           ;(c as any).set('authUser', {
-            id: userRow['id'] as string,
-            email: userRow['email'] as string,
-            name: userRow['name'] as string,
-            role: userRow['role'] as 'admin' | 'user',
+            id: userRow._id,
+            email: userRow.email,
+            name: userRow.name,
+            role: userRow.role,
           })
-          await loadUserScope(c, agentUserId, userRow['role'] as string)
+          await loadUserScope(c, agentUserId, userRow.role)
         }
 
-        const projects = await dbAll(
-          `SELECT p.id FROM projects p
-           JOIN organizations o ON p.org_id = o.id
-           WHERE o.user_id = ?`,
-          [agentUserId],
-        )
-        ;(c as any).set('agentUserProjectIds', projects.map((p) => p['id'] as string))
+        ;(c as any).set('agentUserProjectIds', await loadAgentProjectIds(agentUserId))
       } else {
         ;(c as any).set('agentUserProjectIds', [])
       }

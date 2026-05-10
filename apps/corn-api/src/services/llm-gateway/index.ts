@@ -20,7 +20,7 @@
 //   - Insert is fire-and-forget (`void`) so LLM latency isn't
 //     extended by the second write.
 
-import { dbRun } from '../../db/client.js'
+import { LlmGatewayLog, QueryLog } from '../../db/mongoose/index.js'
 import { getSetting } from '../settings.js'
 import { callOpenAI } from './adapters/openai.js'
 import { callAnthropic } from './adapters/anthropic.js'
@@ -83,26 +83,20 @@ async function logGatewayRow(row: {
   userId: string | null
   sessionId: string | null
 }): Promise<void> {
-  await dbRun(
-    `INSERT INTO llm_gateway_logs
-       (task_name, provider_id, provider, model, input_tokens, output_tokens,
-        cost_usd, latency_ms, cached, error, user_id, session_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      row.taskName,
-      row.providerId,
-      row.provider,
-      row.model,
-      row.inputTokens,
-      row.outputTokens,
-      row.costUsd,
-      row.latencyMs,
-      row.cached ? 1 : 0,
-      row.error,
-      row.userId,
-      row.sessionId,
-    ],
-  )
+  await LlmGatewayLog.create({
+    task_name: row.taskName,
+    provider_id: row.providerId,
+    provider: row.provider,
+    model: row.model,
+    input_tokens: row.inputTokens,
+    output_tokens: row.outputTokens,
+    cost_usd: row.costUsd,
+    latency_ms: row.latencyMs,
+    cached: row.cached,
+    error: row.error,
+    user_id: row.userId,
+    session_id: row.sessionId,
+  } as Parameters<typeof LlmGatewayLog.create>[0])
 }
 
 // Fire-and-forget mirror into `query_logs` so the existing cost
@@ -114,21 +108,15 @@ async function logQueryRow(
   inputSize: number,
   outputSize: number,
 ): Promise<void> {
-  await dbRun(
-    `INSERT INTO query_logs
-       (agent_id, tool, project_id, input_size, output_size,
-        compute_tokens, compute_model)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [
-      req.taskName ?? 'llm_gateway',
-      'llm_gateway',
-      req.sessionId ?? null,
-      inputSize,
-      outputSize,
-      resp.inputTokens + resp.outputTokens,
-      resp.model,
-    ],
-  )
+  await QueryLog.create({
+    agent_id: req.taskName ?? 'llm_gateway',
+    tool: 'llm_gateway',
+    project_id: req.sessionId ?? null,
+    input_size: inputSize,
+    output_size: outputSize,
+    compute_tokens: resp.inputTokens + resp.outputTokens,
+    compute_model: resp.model,
+  } as Parameters<typeof QueryLog.create>[0])
 }
 
 async function parseFallbackChain(): Promise<string[]> {

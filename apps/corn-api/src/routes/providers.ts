@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
-import { dbAll, dbGet, dbRun } from '../db/client.js'
 import { generateId } from '@corn/shared-utils'
+import { ProviderAccount } from '../db/mongoose/index.js'
 import { jwtAuthMiddleware, getAuthCtx } from '../middleware/auth.js'
 import { encrypt, isEncrypted, maskSecret } from '../services/secrets.js'
 
@@ -13,8 +13,9 @@ function sanitizeProvider(row: Record<string, unknown>): Record<string, unknown>
   const masked = apiKey ? maskSecret(apiKey) : ''
   const last4 = masked.startsWith('\u2022\u2022\u2022\u2022') ? masked.slice(4) : ''
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { api_key: _drop, ...safe } = row
+  const { api_key: _drop, _id, ...safe } = row
   return {
+    id: _id ?? row['id'],
     ...safe,
     api_key_masked: masked,
     api_key_last4: last4,
@@ -40,18 +41,17 @@ const PROVIDER_PRESETS: Record<string, { apiBase: string; authType: string; mode
 
 providersRouter.use('*', jwtAuthMiddleware)
 
-// ─── List providers ─────────────────────────────
+// ─── List providers ─────────────────
 providersRouter.get('/', async (c) => {
   const { user } = getAuthCtx(c)
 
-  const rows = user.role === 'admin'
-    ? await dbAll('SELECT * FROM provider_accounts ORDER BY created_at DESC')
-    : await dbAll('SELECT * FROM provider_accounts WHERE user_id = ? ORDER BY created_at DESC', [user.id])
+  const filter = user.role === 'admin' ? {} : { user_id: user.id }
+  const rows = await ProviderAccount.find(filter).sort({ created_at: -1 }).lean()
 
-  return c.json({ providers: rows.map(sanitizeProvider) })
+  return c.json({ providers: rows.map((r) => sanitizeProvider(r as Record<string, unknown>)) })
 })
 
-// ─── Create provider ────────────────────────────
+// ─── Create provider ──────────────────────
 providersRouter.post('/', async (c) => {
   const body = await c.req.json()
   const { user } = getAuthCtx(c)
@@ -67,80 +67,77 @@ providersRouter.post('/', async (c) => {
 
   // S1.5 — wrap api_key in AES-GCM envelope before write. encrypt() is
   // idempotent (already-encrypted values pass through) and null-safe.
+  // The encrypted string is preserved bit-for-bit (HIGH RISK section 6.1).
   const rawKey: string | null = body.apiKey || null
   const storedKey = rawKey === null ? null : (encrypt(rawKey) as string)
-  const encryptedFlag = storedKey && isEncrypted(storedKey) ? 1 : 0
+  const encryptedFlag = Boolean(storedKey && isEncrypted(storedKey))
 
-  await dbRun(
-    `INSERT INTO provider_accounts (id, name, type, auth_type, api_base, api_key, api_key_encrypted, status, capabilities, models, user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      id,
-      body.name || type,
-      type,
-      authType,
-      apiBase,
-      storedKey,
-      encryptedFlag,
-      body.status || 'enabled',
-      JSON.stringify(body.capabilities || ['chat']),
-      JSON.stringify(models),
-      user.id,
-    ],
-  )
+  await ProviderAccount.create({
+    _id: id,
+    name: body.name || type,
+    type,
+    auth_type: authType,
+    api_base: apiBase,
+    api_key: storedKey,
+    api_key_encrypted: encryptedFlag,
+    status: body.status || 'enabled',
+    capabilities: body.capabilities || ['chat'],
+    models,
+    user_id: user.id,
+  } as Parameters<typeof ProviderAccount.create>[0])
 
   return c.json({ ok: true, id })
 })
 
-// ─── Update provider ─────────────────────────────────────
+// ─── Update provider ──────────────────────────
 providersRouter.patch('/:id', async (c) => {
   const { id } = c.req.param()
   const { user } = getAuthCtx(c)
   const body = await c.req.json()
 
   if (user.role !== 'admin') {
-    const p = await dbGet('SELECT user_id FROM provider_accounts WHERE id = ?', [id])
+    const p = await ProviderAccount.findById(id, { user_id: 1 }).lean()
     if (!p) return c.json({ error: 'Provider not found' }, 404)
-    if (p['user_id'] !== user.id) return c.json({ error: 'Access denied' }, 403)
+    if (p.user_id !== user.id) return c.json({ error: 'Access denied' }, 403)
   }
 
-  const fields: string[] = []
-  const values: unknown[] = []
-
-  if (body.name) { fields.push('name = ?'); values.push(body.name) }
-  if (body.status) { fields.push('status = ?'); values.push(body.status) }
-  if (body.apiBase) { fields.push('api_base = ?'); values.push(body.apiBase) }
+  const update: Record<string, unknown> = {}
+  if (body.name) update['name'] = body.name
+  if (body.status) update['status'] = body.status
+  if (body.apiBase) update['api_base'] = body.apiBase
   if (body.apiKey !== undefined) {
-    // S1.5 — encrypt rotated key, also flip the tracking flag in the same
-    // UPDATE so a partial sweep can resume without re-encrypting this row.
+    // S1.5 — encrypt rotated key + flip tracking flag in the same write
+    // so a partial sweep can resume without re-encrypting this row.
     const rawKey: string | null = body.apiKey || null
     const storedKey = rawKey === null ? null : (encrypt(rawKey) as string)
-    const encryptedFlag = storedKey && isEncrypted(storedKey) ? 1 : 0
-    fields.push('api_key = ?'); values.push(storedKey)
-    fields.push('api_key_encrypted = ?'); values.push(encryptedFlag)
+    const encryptedFlag = Boolean(storedKey && isEncrypted(storedKey))
+    update['api_key'] = storedKey
+    update['api_key_encrypted'] = encryptedFlag
   }
-  if (body.models) { fields.push('models = ?'); values.push(JSON.stringify(body.models)) }
-  if (body.capabilities) { fields.push('capabilities = ?'); values.push(JSON.stringify(body.capabilities)) }
+  if (body.models) update['models'] = body.models
+  if (body.capabilities) update['capabilities'] = body.capabilities
 
-  fields.push("updated_at = datetime('now')")
-  values.push(id)
+  if (Object.keys(update).length === 0) {
+    return c.json({ ok: true })
+  }
 
-  await dbRun(`UPDATE provider_accounts SET ${fields.join(', ')} WHERE id = ?`, values)
+  // updated_at is auto-managed by `timestamps: true` on the schema.
+  await ProviderAccount.updateOne({ _id: id }, { $set: update })
   return c.json({ ok: true })
 })
 
-// ─── Delete provider ─────────────────────────────────────
+// ─── Delete provider ──────────────────────────
 providersRouter.delete('/:id', async (c) => {
   const { id } = c.req.param()
   const { user } = getAuthCtx(c)
 
   if (user.role !== 'admin') {
-    const p = await dbGet('SELECT user_id FROM provider_accounts WHERE id = ?', [id])
+    const p = await ProviderAccount.findById(id, { user_id: 1 }).lean()
     if (!p) return c.json({ error: 'Provider not found' }, 404)
-    if (p['user_id'] !== user.id) return c.json({ error: 'Access denied' }, 403)
+    if (p.user_id !== user.id) return c.json({ error: 'Access denied' }, 403)
   }
 
-  await dbRun('DELETE FROM provider_accounts WHERE id = ?', [id])
+  await ProviderAccount.deleteOne({ _id: id })
   return c.json({ ok: true })
 })
 

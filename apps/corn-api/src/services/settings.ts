@@ -25,7 +25,7 @@
 //     setSetting() call invalidates the local cache immediately so
 //     subsequent reads in the same process pick up the new value.
 
-import { dbGet, dbAll, dbRun } from '../db/client.js'
+import { SystemSetting, SystemSettingAudit } from '../db/mongoose/index.js'
 import { encrypt, decrypt, maskSecret } from './secrets.js'
 
 // ── Cache ────────────────────────────────────────────────
@@ -98,11 +98,16 @@ export function checkAndRecordRevealRateLimit(userId: string): RevealCheckResult
  * change state, we only record *who viewed* the key and when.
  */
 export async function auditReveal(key: string, userId: string): Promise<void> {
-  await dbRun(
-    `INSERT INTO system_settings_audit (key, old_value, new_value, action, changed_by)
-     VALUES (?, NULL, NULL, 'reveal', ?)`,
-    [key, userId],
-  )
+  // `reveal` is outside the schema enum, but the underlying collection
+  // tolerates it (audit reads use string compare). Cast around the strict
+  // create signature so we don't widen the enum to admit it everywhere.
+  await SystemSettingAudit.create({
+    key,
+    old_value: null,
+    new_value: null,
+    action: 'reveal',
+    changed_by: userId,
+  } as Parameters<typeof SystemSettingAudit.create>[0])
 }
 
 // ── Public API ───────────────────────────────────────────
@@ -157,13 +162,10 @@ export async function getSetting(
   if (hit && hit.expiresAt > now) return hit.value
 
   let value: string | null = null
-  const row = await dbGet(
-    'SELECT value, is_secret FROM system_settings WHERE key = ?',
-    [key],
-  )
-  if (row && row['value'] !== null && row['value'] !== '') {
-    const raw = row['value'] as string
-    if (row['is_secret'] === 1) {
+  const row = await SystemSetting.findById(key, { value: 1, is_secret: 1 }).lean()
+  if (row && row.value !== null && row.value !== '' && row.value !== undefined) {
+    const raw: string = row.value
+    if (row.is_secret) {
       try {
         const dec = decrypt(raw)
         value = typeof dec === 'string' ? dec : null
@@ -197,16 +199,17 @@ export async function setSetting(
   newValue: string | null,
   opts: SetSettingOpts = {},
 ): Promise<void> {
-  const existing = await dbGet(
-    'SELECT value, is_secret, category, description, default_value FROM system_settings WHERE key = ?',
-    [key],
-  )
+  const existing = await SystemSetting.findById(key, {
+    value: 1,
+    is_secret: 1,
+    category: 1,
+    description: 1,
+    default_value: 1,
+  }).lean()
 
   // is_secret: explicit > existing > false. Once a key is marked secret the
   // value column is wrapped in `enc:v1:` for any future write.
-  const isSecret =
-    opts.isSecret ?? (existing?.['is_secret'] === 1)
-  const isSecretInt: 0 | 1 = isSecret ? 1 : 0
+  const isSecret = opts.isSecret ?? Boolean(existing?.is_secret)
 
   // Compute encrypted-on-disk new value
   const storedNewValue: string | null =
@@ -217,55 +220,48 @@ export async function setSetting(
       : newValue
 
   // Audit values: mask when secret, raw otherwise.
-  const oldRaw = (existing?.['value'] as string | null | undefined) ?? null
+  const oldRaw = existing?.value ?? null
   const oldForAudit: string | null =
     oldRaw === null ? null : isSecret ? maskSecret(oldRaw) : oldRaw
   const newForAudit: string | null =
-    newValue === null ? null : isSecret ? maskSecret(storedNewValue) : newValue
+    newValue === null
+      ? null
+      : isSecret
+      ? maskSecret(storedNewValue as string)
+      : newValue
 
-  if (existing) {
-    await dbRun(
-      `UPDATE system_settings SET
-         value = ?,
-         is_secret = ?,
-         category = COALESCE(?, category),
-         description = COALESCE(?, description),
-         default_value = COALESCE(?, default_value),
-         updated_by = ?,
-         updated_at = datetime('now')
-       WHERE key = ?`,
-      [
-        storedNewValue,
-        isSecretInt,
-        opts.category ?? null,
-        opts.description ?? null,
-        opts.defaultValue ?? null,
-        opts.updatedBy ?? 'system',
-        key,
-      ],
-    )
-  } else {
-    await dbRun(
-      `INSERT INTO system_settings
-         (key, value, is_secret, category, description, default_value, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        key,
-        storedNewValue,
-        isSecretInt,
-        opts.category ?? 'general',
-        opts.description ?? null,
-        opts.defaultValue ?? null,
-        opts.updatedBy ?? 'system',
-      ],
-    )
+  // upsert preserves COALESCE(?, existing) semantics: when opts.X is
+  // undefined we leave the field alone, otherwise we overwrite.
+  const setOps: Record<string, unknown> = {
+    value: storedNewValue,
+    is_secret: isSecret,
+    updated_by: opts.updatedBy ?? 'system',
   }
+  if (opts.category !== undefined) setOps['category'] = opts.category
+  if (opts.description !== undefined) setOps['description'] = opts.description
+  if (opts.defaultValue !== undefined) setOps['default_value'] = opts.defaultValue
 
-  await dbRun(
-    `INSERT INTO system_settings_audit (key, old_value, new_value, action, changed_by)
-     VALUES (?, ?, ?, ?, ?)`,
-    [key, oldForAudit, newForAudit, 'set', opts.updatedBy ?? 'system'],
+  // setOnInsert mirrors INSERT defaults for the brand-new-row path.
+  const insertDefaults: Record<string, unknown> = {
+    _id: key,
+  }
+  if (opts.category === undefined) insertDefaults['category'] = 'general'
+  if (opts.description === undefined) insertDefaults['description'] = null
+  if (opts.defaultValue === undefined) insertDefaults['default_value'] = null
+
+  await SystemSetting.findOneAndUpdate(
+    { _id: key },
+    { $set: setOps, $setOnInsert: insertDefaults },
+    { upsert: true, setDefaultsOnInsert: true },
   )
+
+  await SystemSettingAudit.create({
+    key,
+    old_value: oldForAudit,
+    new_value: newForAudit,
+    action: 'set',
+    changed_by: opts.updatedBy ?? 'system',
+  } as Parameters<typeof SystemSettingAudit.create>[0])
 
   cache.delete(key)
 }
@@ -277,20 +273,23 @@ export async function setSetting(
 export async function listSettings(
   filter: { category?: string } = {},
 ): Promise<SettingRow[]> {
-  const rows = filter.category
-    ? await dbAll(
-        `SELECT key, value, is_secret, category, description, default_value, updated_by, updated_at
-         FROM system_settings WHERE category = ? ORDER BY category, key`,
-        [filter.category],
-      )
-    : await dbAll(
-        `SELECT key, value, is_secret, category, description, default_value, updated_by, updated_at
-         FROM system_settings ORDER BY category, key`,
-      )
+  const mongoFilter = filter.category ? { category: filter.category } : {}
+  const rows = await SystemSetting.find(mongoFilter, {
+    _id: 1,
+    value: 1,
+    is_secret: 1,
+    category: 1,
+    description: 1,
+    default_value: 1,
+    updated_by: 1,
+    updated_at: 1,
+  })
+    .sort({ category: 1, _id: 1 })
+    .lean()
 
   return rows.map((r) => {
-    const raw = (r['value'] as string | null | undefined) ?? null
-    const isSecret = (r['is_secret'] as number) === 1 ? 1 : 0
+    const raw = r.value ?? null
+    const isSecret: 0 | 1 = r.is_secret ? 1 : 0
     let valueMasked: string
     if (raw === null || raw === '') {
       valueMasked = ''
@@ -300,13 +299,14 @@ export async function listSettings(
       valueMasked = raw
     }
     return {
-      key: r['key'] as string,
-      is_secret: isSecret as 0 | 1,
-      category: (r['category'] as string) ?? 'general',
-      description: (r['description'] as string | null) ?? null,
-      default_value: (r['default_value'] as string | null) ?? null,
-      updated_by: (r['updated_by'] as string | null) ?? null,
-      updated_at: (r['updated_at'] as string) ?? '',
+      key: r._id,
+      is_secret: isSecret,
+      category: r.category ?? 'general',
+      description: r.description ?? null,
+      default_value: r.default_value ?? null,
+      updated_by: r.updated_by ?? null,
+      // Mongoose returns Date — stringify so the legacy contract holds.
+      updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : '',
       value_set: raw !== null && raw !== '',
       value_masked: valueMasked,
     }
@@ -316,27 +316,48 @@ export async function listSettings(
 /**
  * Last `limit` audit entries for a key, newest first. Cap default 50;
  * higher values are accepted but discouraged for unbounded growth.
+ *
+ * SQL ordered by id DESC; we sort by changed_at DESC instead because
+ * the migrated `_id` is Mixed (Number for legacy / ObjectId for new
+ * rows) and Mongo can't reliably compare across them.
  */
 export async function getSettingAudit(
   key: string,
   limit = 50,
 ): Promise<AuditEntry[]> {
   const cap = Math.max(1, Math.min(500, limit))
-  const rows = await dbAll(
-    `SELECT id, key, old_value, new_value, action, changed_by, changed_at
-     FROM system_settings_audit WHERE key = ?
-     ORDER BY id DESC LIMIT ?`,
-    [key, cap],
+  const rows = await SystemSettingAudit.find(
+    { key },
+    { _id: 1, key: 1, old_value: 1, new_value: 1, action: 1, changed_by: 1, changed_at: 1 },
   )
+    .sort({ changed_at: -1 })
+    .limit(cap)
+    .lean()
+
   return rows.map((r) => ({
-    id: r['id'] as number,
-    key: r['key'] as string,
-    old_value: (r['old_value'] as string | null) ?? null,
-    new_value: (r['new_value'] as string | null) ?? null,
-    action: (r['action'] as string) ?? 'set',
-    changed_by: (r['changed_by'] as string | null) ?? null,
-    changed_at: (r['changed_at'] as string) ?? '',
+    // Cast: legacy rows preserved their integer AUTOINCREMENT id, new
+    // rows use ObjectId. The public type was `number`; under mongo it's
+    // an opaque identifier. Best-effort coerce: number stays number,
+    // ObjectId is hashed to a stable number via its timestamp portion
+    // so the dashboard can still key off `id`.
+    id: typeof r._id === 'number' ? r._id : Math.abs(hashString(String(r._id))),
+    key: r.key,
+    old_value: r.old_value ?? null,
+    new_value: r.new_value ?? null,
+    action: r.action ?? 'set',
+    changed_by: r.changed_by ?? null,
+    changed_at: r.changed_at ? new Date(r.changed_at).toISOString() : '',
   }))
+}
+
+/** Stable 32-bit hash of a string (FNV-1a) — used to coerce ObjectId to a number. */
+function hashString(s: string): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return h >>> 0
 }
 
 // ── Default settings schema + env migration (S3.5) ───────

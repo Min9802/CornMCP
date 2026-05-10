@@ -20,7 +20,7 @@
 // in-memory only; `llm_gateway_logs.provider_id` records `env:*` so
 // ops can audit and badge them in UI (S6).
 
-import { dbGet, dbAll } from '../../db/client.js'
+import { ProviderAccount } from '../../db/mongoose/index.js'
 import { getSetting } from '../settings.js'
 import { decrypt } from '../secrets.js'
 import {
@@ -61,19 +61,15 @@ function isProviderType(x: string | null | undefined): x is ProviderType {
 }
 
 async function fetchRealRow(providerId: string): Promise<ResolvedProvider | null> {
-  const row = await dbGet(
-    `SELECT id, type, api_base, api_key, status
-     FROM provider_accounts
-     WHERE id = ? AND status = 'enabled'
-     LIMIT 1`,
-    [providerId],
-  )
+  const row = await ProviderAccount.findOne(
+    { _id: providerId, status: 'enabled' },
+    { _id: 1, type: 1, api_base: 1, api_key: 1, status: 1 },
+  ).lean()
   if (!row) return null
 
-  const type = row['type'] as string
-  if (!isProviderType(type)) return null
+  if (!isProviderType(row.type)) return null
 
-  const storedKey = row['api_key'] as string | null
+  const storedKey = row.api_key ?? null
   let apiKey = ''
   if (storedKey) {
     const decrypted = decrypt(storedKey)
@@ -82,10 +78,10 @@ async function fetchRealRow(providerId: string): Promise<ResolvedProvider | null
   if (!apiKey) return null // Row exists but key is empty — treat as unconfigured.
 
   return {
-    id: row['id'] as string,
-    provider: type,
+    id: row._id,
+    provider: row.type,
     apiKey,
-    apiBase: (row['api_base'] as string) || DEFAULT_API_BASE[type],
+    apiBase: row.api_base || DEFAULT_API_BASE[row.type],
     virtual: false,
   }
 }
@@ -96,11 +92,8 @@ async function fetchRealRow(providerId: string): Promise<ResolvedProvider | null
  * control (rotate/disable) takes precedence.
  */
 async function hasEnabledRealRowForType(type: ProviderType): Promise<boolean> {
-  const row = await dbGet(
-    `SELECT 1 FROM provider_accounts WHERE type = ? AND status = 'enabled' LIMIT 1`,
-    [type],
-  )
-  return Boolean(row)
+  const count = await ProviderAccount.countDocuments({ type, status: 'enabled' })
+  return count > 0
 }
 
 function buildVirtualProvider(type: ProviderType): ResolvedProvider | null {
@@ -172,13 +165,14 @@ export async function resolveProvider(
   // Admin explicit config ALWAYS outranks env defaults, even when no
   // `llm.default_provider_id` was set.
   if (opts.provider) {
-    const typeRow = await dbGet(
-      `SELECT id FROM provider_accounts WHERE type = ? AND status = 'enabled'
-       ORDER BY created_at ASC LIMIT 1`,
-      [opts.provider],
+    const typeRow = await ProviderAccount.findOne(
+      { type: opts.provider, status: 'enabled' },
+      { _id: 1 },
     )
+      .sort({ created_at: 1 })
+      .lean()
     if (typeRow) {
-      const real = await fetchRealRow(typeRow['id'] as string)
+      const real = await fetchRealRow(typeRow._id)
       if (real) return real
     }
   }
@@ -194,11 +188,14 @@ export async function resolveProvider(
   // virtual fallback — a user who configured Anthropic but not set
   // `llm.default_provider_id` should still get served.
   if (!opts.provider) {
-    const rows = await dbAll(
-      `SELECT id, type FROM provider_accounts WHERE status = 'enabled' ORDER BY created_at ASC`,
+    const rows = await ProviderAccount.find(
+      { status: 'enabled' },
+      { _id: 1, type: 1 },
     )
+      .sort({ created_at: 1 })
+      .lean()
     for (const row of rows) {
-      const real = await fetchRealRow(row['id'] as string)
+      const real = await fetchRealRow(row._id)
       if (real) return real
     }
   }

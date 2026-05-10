@@ -1,7 +1,7 @@
 import ts from 'typescript'
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
-import { join, relative, extname, resolve } from 'node:path'
-import { dbAll, dbGet, dbRun } from '../db/client.js'
+import { existsSync, readdirSync, statSync } from 'node:fs'
+import { join, relative, extname } from 'node:path'
+import { CodeSymbol, CodeEdge, Project } from '../db/mongoose/index.js'
 import { generateId, createLogger } from '@corn/shared-utils'
 
 const logger = createLogger('ast-engine')
@@ -45,6 +45,7 @@ const TS_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx'])
  * Recursively collect all TypeScript/JavaScript files in a directory.
  */
 function collectFiles(dir: string, maxFiles = 5000): string[] {
+  if (!existsSync(dir)) return []
   const files: string[] = []
 
   function walk(current: string) {
@@ -138,6 +139,12 @@ function getDocComment(node: ts.Node, sourceFile: ts.SourceFile): string {
   return ''
 }
 
+// Escape regex metacharacters when interpolating user-supplied strings into
+// $regex queries. Used by the LIKE-equivalent searches below.
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 /**
  * Core: Analyze a TypeScript/JavaScript project and populate the graph database.
  */
@@ -157,10 +164,13 @@ export async function analyzeProject(
     return { filesAnalyzed: 0, symbolsFound: 0, edgesFound: 0 }
   }
 
-  // 2. Clear existing data for this project
+  // 2. Clear existing data for this project. deleteMany() does NOT trigger
+  // the document-level pre('deleteOne') cascade on CodeSymbol — query
+  // middleware is a separate hook — which is exactly what we want here:
+  // we delete edges first, then symbols, atomically per project.
   onProgress?.(10, 'Clearing previous analysis...')
-  await dbRun('DELETE FROM code_edges WHERE project_id = ?', [projectId])
-  await dbRun('DELETE FROM code_symbols WHERE project_id = ?', [projectId])
+  await CodeEdge.deleteMany({ project_id: projectId })
+  await CodeSymbol.deleteMany({ project_id: projectId })
 
   // 3. Create TypeScript program
   onProgress?.(15, 'Creating TypeScript program...')
@@ -178,7 +188,6 @@ export async function analyzeProject(
   }
 
   const program = ts.createProgram(files, compilerOptions)
-  const checker = program.getTypeChecker()
 
   // 4. Extract symbols
   const symbolMap = new Map<string, SymbolInfo>() // key: "filePath:name:kind"
@@ -196,8 +205,10 @@ export async function analyzeProject(
 
   logger.info(`TypeScript program returned ${program.getSourceFiles().length} total source files, ${sourceFiles.length} matched project files`)
 
+  // Symbols are buffered per file then bulk-inserted via insertMany(),
+  // which is significantly faster than the legacy one-at-a-time INSERT.
   for (let fi = 0; fi < sourceFiles.length; fi++) {
-    const sourceFile = sourceFiles[fi]
+    const sourceFile = sourceFiles[fi]!
     const relPath = relative(rootDir, sourceFile.fileName).replace(/\\/g, '/')
     const progress = 20 + Math.floor((fi / sourceFiles.length) * 50)
     if (fi % 20 === 0) {
@@ -273,22 +284,40 @@ export async function analyzeProject(
     ts.forEachChild(sourceFile, child => visitNode(child, null))
 
     // Batch insert symbols for this file
-    for (const sym of fileSymbols) {
-      await dbRun(
-        `INSERT INTO code_symbols (id, project_id, name, kind, file_path, start_line, end_line, exported, signature, doc_comment, parent_symbol_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [sym.id, sym.projectId, sym.name, sym.kind, sym.filePath, sym.startLine, sym.endLine,
-         sym.exported ? 1 : 0, sym.signature, sym.docComment, sym.parentSymbolId],
+    if (fileSymbols.length > 0) {
+      await CodeSymbol.insertMany(
+        fileSymbols.map((sym) => ({
+          _id: sym.id,
+          project_id: sym.projectId,
+          name: sym.name,
+          kind: sym.kind,
+          file_path: sym.filePath,
+          start_line: sym.startLine,
+          end_line: sym.endLine,
+          exported: sym.exported,
+          signature: sym.signature,
+          doc_comment: sym.docComment,
+          parent_symbol_id: sym.parentSymbolId,
+        })) as Parameters<typeof CodeSymbol.insertMany>[0],
       )
-      totalSymbols++
+      totalSymbols += fileSymbols.length
     }
   }
 
-  // 5. Extract edges (imports, calls, extends/implements)
+  // 5. Extract edges (imports, calls, extends/implements). Buffer per file
+  // and bulk-insert at the end.
   onProgress?.(75, 'Building dependency graph...')
+  const edgeBuffer: Array<{
+    project_id: string
+    source_symbol_id: string
+    target_symbol_id: string
+    kind: string
+    file_path: string
+    line_number: number
+  }> = []
 
   for (let fi = 0; fi < sourceFiles.length; fi++) {
-    const sourceFile = sourceFiles[fi]
+    const sourceFile = sourceFiles[fi]!
     const relPath = relative(rootDir, sourceFile.fileName).replace(/\\/g, '/')
 
     if (fi % 20 === 0) {
@@ -316,11 +345,14 @@ export async function analyzeProject(
 
                   if (sourceSymbol) {
                     const { line } = sourceFile.getLineAndCharacterOfPosition(element.getStart(sourceFile))
-                    await dbRun(
-                      `INSERT INTO code_edges (project_id, source_symbol_id, target_symbol_id, kind, file_path, line_number)
-                       VALUES (?, ?, ?, 'imports', ?, ?)`,
-                      [projectId, sourceSymbol.id, targets[0].id, relPath, line + 1],
-                    )
+                    edgeBuffer.push({
+                      project_id: projectId,
+                      source_symbol_id: sourceSymbol.id,
+                      target_symbol_id: targets[0]!.id,
+                      kind: 'imports',
+                      file_path: relPath,
+                      line_number: line + 1,
+                    })
                     totalEdges++
                   }
                 }
@@ -343,11 +375,14 @@ export async function analyzeProject(
               const targets = symbolsByName.get(baseName)
               if (targets && targets.length > 0) {
                 const { line } = sourceFile.getLineAndCharacterOfPosition(typeExpr.getStart(sourceFile))
-                await dbRun(
-                  `INSERT INTO code_edges (project_id, source_symbol_id, target_symbol_id, kind, file_path, line_number)
-                   VALUES (?, ?, ?, ?, ?, ?)`,
-                  [projectId, classSymbol.id, targets[0].id, edgeKind, relPath, line + 1],
-                )
+                edgeBuffer.push({
+                  project_id: projectId,
+                  source_symbol_id: classSymbol.id,
+                  target_symbol_id: targets[0]!.id,
+                  kind: edgeKind,
+                  file_path: relPath,
+                  line_number: line + 1,
+                })
                 totalEdges++
               }
             }
@@ -371,12 +406,15 @@ export async function analyzeProject(
             .filter(s => s.filePath === relPath && s.startLine <= callLine + 1 && s.endLine >= callLine + 1)
           const caller = callerSymbols.pop() // innermost
 
-          if (caller && caller.id !== targets[0].id) {
-            dbRun(
-              `INSERT INTO code_edges (project_id, source_symbol_id, target_symbol_id, kind, file_path, line_number)
-               VALUES (?, ?, ?, 'calls', ?, ?)`,
-              [projectId, caller.id, targets[0].id, relPath, callLine + 1],
-            ).catch(() => {}) // best effort
+          if (caller && caller.id !== targets[0]!.id) {
+            edgeBuffer.push({
+              project_id: projectId,
+              source_symbol_id: caller.id,
+              target_symbol_id: targets[0]!.id,
+              kind: 'calls',
+              file_path: relPath,
+              line_number: callLine + 1,
+            })
             totalEdges++
           }
         }
@@ -387,11 +425,19 @@ export async function analyzeProject(
     findCalls(sourceFile)
   }
 
-  // 6. Update project metadata
+  // Flush edges in batches to avoid one huge insertMany on big projects.
+  const BATCH = 1000
+  for (let i = 0; i < edgeBuffer.length; i += BATCH) {
+    const slice = edgeBuffer.slice(i, i + BATCH)
+    if (slice.length === 0) continue
+    await CodeEdge.insertMany(slice as Parameters<typeof CodeEdge.insertMany>[0])
+  }
+
+  // 6. Update project metadata. updated_at is auto-managed by `timestamps`.
   onProgress?.(95, 'Finalizing...')
-  await dbRun(
-    `UPDATE projects SET indexed_symbols = ?, indexed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
-    [totalSymbols, projectId],
+  await Project.updateOne(
+    { _id: projectId },
+    { $set: { indexed_symbols: totalSymbols, indexed_at: new Date() } },
   )
 
   logger.info(`Analysis complete: ${sourceFiles.length} files, ${totalSymbols} symbols, ${totalEdges} edges`)
@@ -407,27 +453,55 @@ export async function analyzeProject(
 // ─── Query Functions ────────────────────────────────────
 
 /**
- * Search symbols by name pattern.
+ * Search symbols by name pattern. SQL had a CASE expression to surface
+ * prefix matches first; we approximate by sorting client-side after
+ * a single $regex query (small N — up to `limit`).
  */
 export async function searchSymbols(
   projectId: string,
   query: string,
   limit = 20,
 ): Promise<Record<string, unknown>[]> {
-  return dbAll(
-    `SELECT id, name, kind, file_path, start_line, end_line, exported, signature, doc_comment
-     FROM code_symbols
-     WHERE project_id = ? AND (name LIKE ? OR file_path LIKE ? OR signature LIKE ?)
-     ORDER BY
-       CASE WHEN name LIKE ? THEN 0 ELSE 1 END,
-       exported DESC, name
-     LIMIT ?`,
-    [projectId, `%${query}%`, `%${query}%`, `%${query}%`, `${query}%`, limit],
+  const escaped = escapeRegex(query)
+  const re = new RegExp(escaped, 'i')
+
+  const docs = await CodeSymbol.find(
+    {
+      project_id: projectId,
+      $or: [{ name: re }, { file_path: re }, { signature: re }],
+    },
+    {
+      _id: 1,
+      name: 1,
+      kind: 1,
+      file_path: 1,
+      start_line: 1,
+      end_line: 1,
+      exported: 1,
+      signature: 1,
+      doc_comment: 1,
+    },
   )
+    .limit(limit * 2) // overfetch so the prefix-priority sort has room
+    .lean()
+
+  // Prefix-match-first ordering replicates the legacy SQL CASE expression.
+  const prefixRe = new RegExp(`^${escaped}`, 'i')
+  docs.sort((a, b) => {
+    const ap = prefixRe.test(a.name) ? 0 : 1
+    const bp = prefixRe.test(b.name) ? 0 : 1
+    if (ap !== bp) return ap - bp
+    if (a.exported !== b.exported) return a.exported ? -1 : 1
+    return String(a.name).localeCompare(String(b.name))
+  })
+  return docs.slice(0, limit).map((d) => ({ id: d._id, ...d }))
 }
 
 /**
  * Get full context for a symbol: definition, callers, callees, related types.
+ * The legacy implementation used SQL JOINs across code_edges + code_symbols;
+ * here we issue two queries per relation (edges first, then a single
+ * `$in` symbol fetch).
  */
 export async function getSymbolContext(
   projectId: string,
@@ -444,80 +518,108 @@ export async function getSymbolContext(
   // Find the symbol
   let symbol: Record<string, unknown> | undefined
   if (file) {
-    symbol = await dbGet(
-      `SELECT * FROM code_symbols WHERE project_id = ? AND name = ? AND file_path LIKE ?`,
-      [projectId, name, `%${file}%`],
-    )
+    const found = await CodeSymbol.findOne({
+      project_id: projectId,
+      name,
+      file_path: { $regex: escapeRegex(file), $options: 'i' },
+    })
+      .sort({ exported: -1 })
+      .lean()
+    if (found) symbol = { id: found._id, ...found }
   }
   if (!symbol) {
-    symbol = await dbGet(
-      `SELECT * FROM code_symbols WHERE project_id = ? AND name = ? ORDER BY exported DESC`,
-      [projectId, name],
-    )
+    const found = await CodeSymbol.findOne({ project_id: projectId, name })
+      .sort({ exported: -1 })
+      .lean()
+    if (found) symbol = { id: found._id, ...found }
   }
 
   if (!symbol) {
     // Fuzzy search
-    const fuzzy = await dbAll(
-      `SELECT * FROM code_symbols WHERE project_id = ? AND name LIKE ? ORDER BY exported DESC LIMIT 1`,
-      [projectId, `%${name}%`],
-    )
-    symbol = fuzzy[0]
+    const fuzzy = await CodeSymbol.findOne({
+      project_id: projectId,
+      name: { $regex: escapeRegex(name), $options: 'i' },
+    })
+      .sort({ exported: -1 })
+      .lean()
+    if (fuzzy) symbol = { id: fuzzy._id, ...fuzzy }
   }
 
   if (!symbol) {
     return { symbol: undefined, callers: [], callees: [], importedBy: [], extends_: [], implementedBy: [] }
   }
 
-  const symbolId = symbol.id as string
+  const symbolId = symbol['id'] as string
 
-  // Callers: who calls this symbol?
-  const callers = await dbAll(
-    `SELECT s.name, s.kind, s.file_path, s.start_line, e.line_number
-     FROM code_edges e JOIN code_symbols s ON e.source_symbol_id = s.id
-     WHERE e.target_symbol_id = ? AND e.kind = 'calls'
-     ORDER BY s.file_path, e.line_number`,
-    [symbolId],
+  // Helper: load `code_symbols` rows for an edge query, then merge with
+  // the matching edge metadata (file_path / line_number).
+  async function joinEdgesToSymbols(
+    edgeFilter: Record<string, unknown>,
+    direction: 'source' | 'target',
+    extraFields: Array<'line_number'> = ['line_number'],
+  ): Promise<Record<string, unknown>[]> {
+    const edges = await CodeEdge.find(
+      edgeFilter as unknown as Parameters<typeof CodeEdge.find>[0],
+      {
+        source_symbol_id: 1,
+        target_symbol_id: 1,
+        file_path: 1,
+        line_number: 1,
+      },
+    ).lean()
+    if (edges.length === 0) return []
+    const symbolIds = edges.map((e) =>
+      direction === 'source' ? e.source_symbol_id : e.target_symbol_id,
+    )
+    const syms = await CodeSymbol.find(
+      { _id: { $in: symbolIds } },
+      { _id: 1, name: 1, kind: 1, file_path: 1, start_line: 1 },
+    ).lean()
+    const symMap = new Map(syms.map((s) => [s._id, s]))
+    return edges.flatMap((e) => {
+      const sid = direction === 'source' ? e.source_symbol_id : e.target_symbol_id
+      const s = symMap.get(sid)
+      if (!s) return []
+      const out: Record<string, unknown> = {
+        name: s.name,
+        kind: s.kind,
+        file_path: s.file_path,
+        start_line: s.start_line,
+      }
+      if (extraFields.includes('line_number')) out['line_number'] = e.line_number
+      return [out]
+    })
+  }
+
+  const callers = await joinEdgesToSymbols(
+    { target_symbol_id: symbolId, kind: 'calls' },
+    'source',
   )
-
-  // Callees: what does this symbol call?
-  const callees = await dbAll(
-    `SELECT s.name, s.kind, s.file_path, s.start_line, e.line_number
-     FROM code_edges e JOIN code_symbols s ON e.target_symbol_id = s.id
-     WHERE e.source_symbol_id = ? AND e.kind = 'calls'
-     ORDER BY e.line_number`,
-    [symbolId],
+  const callees = await joinEdgesToSymbols(
+    { source_symbol_id: symbolId, kind: 'calls' },
+    'target',
   )
-
-  // Imported by
-  const importedBy = await dbAll(
-    `SELECT s.name, s.kind, s.file_path, e.line_number
-     FROM code_edges e JOIN code_symbols s ON e.source_symbol_id = s.id
-     WHERE e.target_symbol_id = ? AND e.kind = 'imports'`,
-    [symbolId],
+  const importedBy = await joinEdgesToSymbols(
+    { target_symbol_id: symbolId, kind: 'imports' },
+    'source',
   )
-
-  // Extends
-  const extends_ = await dbAll(
-    `SELECT s.name, s.kind, s.file_path
-     FROM code_edges e JOIN code_symbols s ON e.target_symbol_id = s.id
-     WHERE e.source_symbol_id = ? AND e.kind IN ('extends', 'implements')`,
-    [symbolId],
+  const extends_ = await joinEdgesToSymbols(
+    { source_symbol_id: symbolId, kind: { $in: ['extends', 'implements'] } },
+    'target',
+    [],
   )
-
-  // Implemented by (reverse)
-  const implementedBy = await dbAll(
-    `SELECT s.name, s.kind, s.file_path
-     FROM code_edges e JOIN code_symbols s ON e.source_symbol_id = s.id
-     WHERE e.target_symbol_id = ? AND e.kind IN ('extends', 'implements')`,
-    [symbolId],
+  const implementedBy = await joinEdgesToSymbols(
+    { target_symbol_id: symbolId, kind: { $in: ['extends', 'implements'] } },
+    'source',
+    [],
   )
 
   return { symbol, callers, callees, importedBy, extends_, implementedBy }
 }
 
 /**
- * Get downstream/upstream impact of a symbol.
+ * Get downstream/upstream impact of a symbol. Implements the legacy
+ * recursive CTE via Mongo's `$graphLookup` aggregation stage.
  */
 export async function getSymbolImpact(
   projectId: string,
@@ -531,27 +633,30 @@ export async function getSymbolImpact(
   totalAffected: number
 }> {
   // Find the target symbol
-  let targetSymbol = await dbGet(
-    `SELECT * FROM code_symbols WHERE project_id = ? AND name = ? ORDER BY exported DESC`,
-    [projectId, target],
-  )
-  if (!targetSymbol) {
-    targetSymbol = await dbGet(
-      `SELECT * FROM code_symbols WHERE project_id = ? AND name LIKE ? ORDER BY exported DESC`,
-      [projectId, `%${target}%`],
-    )
+  let targetDoc = await CodeSymbol.findOne({ project_id: projectId, name: target })
+    .sort({ exported: -1 })
+    .lean()
+  if (!targetDoc) {
+    targetDoc = await CodeSymbol.findOne({
+      project_id: projectId,
+      name: { $regex: escapeRegex(target), $options: 'i' },
+    })
+      .sort({ exported: -1 })
+      .lean()
   }
 
-  if (!targetSymbol) {
+  if (!targetDoc) {
     // If target looks like a file path, find all symbols in that file
     if (target.includes('/') || target.includes('.')) {
-      const fileSymbols = await dbAll(
-        `SELECT * FROM code_symbols WHERE project_id = ? AND file_path LIKE ? ORDER BY start_line`,
-        [projectId, `%${target}%`],
-      )
+      const fileSymbols = await CodeSymbol.find({
+        project_id: projectId,
+        file_path: { $regex: escapeRegex(target), $options: 'i' },
+      })
+        .sort({ start_line: 1 })
+        .lean()
       return {
         targetSymbol: { name: target, kind: 'file', file_path: target },
-        impact: fileSymbols,
+        impact: fileSymbols.map((s) => ({ id: s._id, ...s })),
         depth: 0,
         totalAffected: fileSymbols.length,
       }
@@ -559,49 +664,81 @@ export async function getSymbolImpact(
     return { targetSymbol: undefined, impact: [], depth: 0, totalAffected: 0 }
   }
 
-  const symbolId = targetSymbol.id as string
+  const symbolId = targetDoc._id
 
-  // Use recursive CTE to find transitive dependencies
-  const edgeDirection = direction === 'downstream'
-    ? 'e.target_symbol_id = r.symbol_id'  // who depends on target
-    : 'e.source_symbol_id = r.symbol_id'  // what target depends on
-  const joinCol = direction === 'downstream' ? 'source_symbol_id' : 'target_symbol_id'
+  // BFS the edge graph manually — Mongo's $graphLookup works across
+  // collections (symbol→edges→symbol) but doesn't honor an edge `kind`
+  // filter cleanly across types. Iterative expansion is simpler and
+  // gives us exact `depth` values.
+  const VALID_KINDS = ['calls', 'imports', 'extends', 'implements']
+  const visited = new Map<string, number>([[symbolId, 0]])
+  let frontier = new Set<string>([symbolId])
 
-  const impact = await dbAll(
-    `WITH RECURSIVE reachable(symbol_id, depth) AS (
-       SELECT ?, 0
-       UNION
-       SELECT e.${joinCol}, r.depth + 1
-       FROM code_edges e
-       JOIN reachable r ON ${edgeDirection}
-       WHERE r.depth < ? AND e.kind IN ('calls', 'imports', 'extends', 'implements')
-     )
-     SELECT DISTINCT s.name, s.kind, s.file_path, s.start_line, s.exported, r.depth
-     FROM reachable r
-     JOIN code_symbols s ON s.id = r.symbol_id
-     WHERE r.depth > 0
-     ORDER BY r.depth, s.file_path, s.name`,
-    [symbolId, maxDepth],
+  for (let depth = 1; depth <= maxDepth && frontier.size > 0; depth++) {
+    const filter =
+      direction === 'downstream'
+        ? { target_symbol_id: { $in: [...frontier] }, kind: { $in: VALID_KINDS } }
+        : { source_symbol_id: { $in: [...frontier] }, kind: { $in: VALID_KINDS } }
+
+    const edges = await CodeEdge.find(
+      filter as unknown as Parameters<typeof CodeEdge.find>[0],
+      { source_symbol_id: 1, target_symbol_id: 1 },
+    ).lean()
+
+    const next = new Set<string>()
+    for (const e of edges) {
+      const neighbour =
+        direction === 'downstream' ? e.source_symbol_id : e.target_symbol_id
+      if (!visited.has(neighbour)) {
+        visited.set(neighbour, depth)
+        next.add(neighbour)
+      }
+    }
+    frontier = next
+  }
+
+  const reachableIds = [...visited.keys()].filter((id) => id !== symbolId)
+  if (reachableIds.length === 0) {
+    return { targetSymbol: { id: targetDoc._id, ...targetDoc }, impact: [], depth: 0, totalAffected: 0 }
+  }
+
+  const symbols = await CodeSymbol.find(
+    { _id: { $in: reachableIds } },
+    { _id: 1, name: 1, kind: 1, file_path: 1, start_line: 1, exported: 1 },
+  ).lean()
+
+  const impact = symbols.map((s) => ({
+    name: s.name,
+    kind: s.kind,
+    file_path: s.file_path,
+    start_line: s.start_line,
+    exported: s.exported,
+    depth: visited.get(s._id) ?? 0,
+  }))
+  // Match the legacy ORDER BY r.depth, s.file_path, s.name.
+  impact.sort((a, b) =>
+    a.depth - b.depth ||
+    String(a.file_path).localeCompare(String(b.file_path)) ||
+    String(a.name).localeCompare(String(b.name)),
   )
 
   return {
-    targetSymbol,
+    targetSymbol: { id: targetDoc._id, ...targetDoc },
     impact,
-    depth: impact.length > 0 ? Math.max(...impact.map(i => i.depth as number)) : 0,
+    depth: impact.length > 0 ? Math.max(...impact.map((i) => i.depth)) : 0,
     totalAffected: impact.length,
   }
 }
 
 /**
- * Translate a basic Cypher-like query to SQL and execute.
+ * Translate a basic Cypher-like query to Mongo and execute. Pattern
+ * coverage matches the legacy SQL implementation 1:1.
  */
 export async function executeCypher(
   projectId: string,
   cypherQuery: string,
 ): Promise<Record<string, unknown>[]> {
   const query = cypherQuery.trim()
-
-  // Parse common Cypher patterns:
 
   // Pattern 1: MATCH (n) WHERE n.name CONTAINS "X" RETURN n.name, labels(n) LIMIT N
   const containsMatch = query.match(
@@ -610,12 +747,14 @@ export async function executeCypher(
   if (containsMatch) {
     const [, , searchTerm, limitStr] = containsMatch
     const limit = parseInt(limitStr ?? '20')
-    return dbAll(
-      `SELECT name, kind AS label, file_path, start_line, end_line, exported, signature
-       FROM code_symbols WHERE project_id = ? AND name LIKE ?
-       ORDER BY exported DESC, name LIMIT ?`,
-      [projectId, `%${searchTerm}%`, limit],
+    const docs = await CodeSymbol.find(
+      { project_id: projectId, name: { $regex: escapeRegex(searchTerm!), $options: 'i' } },
+      { name: 1, kind: 1, file_path: 1, start_line: 1, end_line: 1, exported: 1, signature: 1 },
     )
+      .sort({ exported: -1, name: 1 })
+      .limit(limit)
+      .lean()
+    return docs.map((d) => ({ ...d, label: d.kind }))
   }
 
   // Pattern 2: MATCH (a)-[:CALLS]->(b) WHERE a.name = "X" RETURN b
@@ -625,15 +764,29 @@ export async function executeCypher(
   if (callsMatch) {
     const [, edgeKind, symbolName] = callsMatch
     const kind = edgeKind!.toLowerCase()
-    return dbAll(
-      `SELECT t.name, t.kind, t.file_path, t.start_line, e.line_number
-       FROM code_edges e
-       JOIN code_symbols s ON e.source_symbol_id = s.id
-       JOIN code_symbols t ON e.target_symbol_id = t.id
-       WHERE s.project_id = ? AND s.name = ? AND e.kind = ?
-       ORDER BY t.file_path`,
-      [projectId, symbolName, kind],
-    )
+    const sources = await CodeSymbol.find(
+      { project_id: projectId, name: symbolName },
+      { _id: 1 },
+    ).lean()
+    if (sources.length === 0) return []
+    const sourceIds = sources.map((s) => s._id)
+    const edges = await CodeEdge.find(
+      { source_symbol_id: { $in: sourceIds }, kind },
+      { target_symbol_id: 1, line_number: 1 },
+    ).lean()
+    if (edges.length === 0) return []
+    const targetIds = edges.map((e) => e.target_symbol_id)
+    const targets = await CodeSymbol.find(
+      { _id: { $in: targetIds } },
+      { _id: 1, name: 1, kind: 1, file_path: 1, start_line: 1 },
+    ).lean()
+    const targetMap = new Map(targets.map((t) => [t._id, t]))
+    const out = edges.flatMap((e) => {
+      const t = targetMap.get(e.target_symbol_id)
+      return t ? [{ name: t.name, kind: t.kind, file_path: t.file_path, start_line: t.start_line, line_number: e.line_number }] : []
+    })
+    out.sort((a, b) => String(a.file_path).localeCompare(String(b.file_path)))
+    return out
   }
 
   // Pattern 3: MATCH (n:CLASS) RETURN n  OR  MATCH (n:function) RETURN n
@@ -643,37 +796,39 @@ export async function executeCypher(
   if (kindMatch) {
     const [, kind, limitStr] = kindMatch
     const limit = parseInt(limitStr ?? '20')
-    return dbAll(
-      `SELECT name, kind, file_path, start_line, end_line, exported, signature
-       FROM code_symbols WHERE project_id = ? AND kind = ?
-       ORDER BY name LIMIT ?`,
-      [projectId, kind!.toLowerCase(), limit],
+    return CodeSymbol.find(
+      { project_id: projectId, kind: kind!.toLowerCase() },
+      { name: 1, kind: 1, file_path: 1, start_line: 1, end_line: 1, exported: 1, signature: 1 },
     )
+      .sort({ name: 1 })
+      .limit(limit)
+      .lean() as unknown as Promise<Record<string, unknown>[]>
   }
 
   // Pattern 4: MATCH (n) RETURN n LIMIT N  (return all symbols)
   const allMatch = query.match(/MATCH\s+\(\w+\)\s+RETURN\s+.*?(?:LIMIT\s+(\d+))?$/i)
   if (allMatch) {
     const limit = parseInt(allMatch[1] ?? '20')
-    return dbAll(
-      `SELECT name, kind, file_path, start_line, exported
-       FROM code_symbols WHERE project_id = ?
-       ORDER BY file_path, start_line LIMIT ?`,
-      [projectId, limit],
+    return CodeSymbol.find(
+      { project_id: projectId },
+      { name: 1, kind: 1, file_path: 1, start_line: 1, exported: 1 },
     )
+      .sort({ file_path: 1, start_line: 1 })
+      .limit(limit)
+      .lean() as unknown as Promise<Record<string, unknown>[]>
   }
 
   // Fallback: try a general search with extracted terms
   const terms = query.match(/"([^"]+)"/g)?.map(t => t.replace(/"/g, '')) ?? []
   if (terms.length > 0) {
-    const conditions = terms.map(() => 'name LIKE ?').join(' OR ')
-    const params = terms.map(t => `%${t}%`)
-    return dbAll(
-      `SELECT name, kind, file_path, start_line, exported, signature
-       FROM code_symbols WHERE project_id = ? AND (${conditions})
-       ORDER BY name LIMIT 20`,
-      [projectId, ...params],
+    const orClauses = terms.map((t) => ({ name: { $regex: escapeRegex(t), $options: 'i' } }))
+    return CodeSymbol.find(
+      { project_id: projectId, $or: orClauses },
+      { name: 1, kind: 1, file_path: 1, start_line: 1, exported: 1, signature: 1 },
     )
+      .sort({ name: 1 })
+      .limit(20)
+      .lean() as unknown as Promise<Record<string, unknown>[]>
   }
 
   return [{ error: 'Could not parse Cypher query. Use patterns like: MATCH (n) WHERE n.name CONTAINS "X" RETURN n' }]
@@ -690,34 +845,29 @@ export async function getProjectStats(
   byKind: Record<string, number>
   topFiles: { file: string; count: number }[]
 }> {
-  const totalSymbolsRow = await dbGet(
-    `SELECT COUNT(*) as count FROM code_symbols WHERE project_id = ?`,
-    [projectId],
-  )
-  const totalEdgesRow = await dbGet(
-    `SELECT COUNT(*) as count FROM code_edges WHERE project_id = ?`,
-    [projectId],
-  )
-
-  const kindRows = await dbAll(
-    `SELECT kind, COUNT(*) as count FROM code_symbols WHERE project_id = ? GROUP BY kind ORDER BY count DESC`,
-    [projectId],
-  )
-
-  const topFileRows = await dbAll(
-    `SELECT file_path, COUNT(*) as count FROM code_symbols WHERE project_id = ? GROUP BY file_path ORDER BY count DESC LIMIT 10`,
-    [projectId],
-  )
+  const [totalSymbols, totalEdges, kindAgg, fileAgg] = await Promise.all([
+    CodeSymbol.countDocuments({ project_id: projectId }),
+    CodeEdge.countDocuments({ project_id: projectId }),
+    CodeSymbol.aggregate<{ _id: string; count: number }>([
+      { $match: { project_id: projectId } },
+      { $group: { _id: '$kind', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ]),
+    CodeSymbol.aggregate<{ _id: string; count: number }>([
+      { $match: { project_id: projectId } },
+      { $group: { _id: '$file_path', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 },
+    ]),
+  ])
 
   const byKind: Record<string, number> = {}
-  for (const row of kindRows) {
-    byKind[row.kind as string] = row.count as number
-  }
+  for (const row of kindAgg) byKind[row._id] = row.count
 
   return {
-    totalSymbols: (totalSymbolsRow?.count as number) ?? 0,
-    totalEdges: (totalEdgesRow?.count as number) ?? 0,
+    totalSymbols,
+    totalEdges,
     byKind,
-    topFiles: topFileRows.map(r => ({ file: r.file_path as string, count: r.count as number })),
+    topFiles: fileAgg.map((r) => ({ file: r._id, count: r.count })),
   }
 }

@@ -1,4 +1,4 @@
-import { dbAll, dbRun } from '../db/client.js'
+import { SessionHandoff } from '../db/mongoose/index.js'
 import { createLogger } from '@corn/shared-utils'
 
 const logger = createLogger('session-lifecycle')
@@ -11,11 +11,9 @@ const logger = createLogger('session-lifecycle')
 export async function touchSession(sessionId: string): Promise<void> {
   if (!sessionId) return
   try {
-    await dbRun(
-      `UPDATE session_handoffs
-       SET last_activity_at = datetime('now')
-       WHERE id = ? AND status = 'active'`,
-      [sessionId],
+    await SessionHandoff.updateOne(
+      { _id: sessionId, status: 'active' },
+      { $set: { last_activity_at: new Date() } },
     )
   } catch (err) {
     logger.warn(`touchSession failed for ${sessionId}: ${(err as Error).message}`)
@@ -34,11 +32,9 @@ export async function touchSession(sessionId: string): Promise<void> {
 export async function touchSessionsByAgent(agentId: string): Promise<void> {
   if (!agentId) return
   try {
-    await dbRun(
-      `UPDATE session_handoffs
-       SET last_activity_at = datetime('now')
-       WHERE from_agent = ? AND status = 'active'`,
-      [agentId],
+    await SessionHandoff.updateMany(
+      { from_agent: agentId, status: 'active' },
+      { $set: { last_activity_at: new Date() } },
     )
   } catch (err) {
     logger.warn(`touchSessionsByAgent failed for ${agentId}: ${(err as Error).message}`)
@@ -62,13 +58,17 @@ export async function autoCloseInactiveSessions(
     return { closed: 0, ids: [] }
   }
 
-  const expired = await dbAll(
-    `SELECT id, context
-     FROM session_handoffs
-     WHERE status = 'active'
-       AND datetime(COALESCE(last_activity_at, created_at)) <= datetime('now', ? )`,
-    [`-${timeoutMinutes} minutes`],
-  )
+  // SQL version used `COALESCE(last_activity_at, created_at)` to handle
+  // pre-migration rows that hadn't backfilled last_activity_at yet. The
+  // 0005 migration backfills it from created_at, and the Mongo schema
+  // defaults the field to `Date.now`, so plain `last_activity_at` is
+  // sufficient post-migration.
+  const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000)
+
+  const expired = await SessionHandoff.find(
+    { status: 'active', last_activity_at: { $lte: cutoff } },
+    { _id: 1, context: 1 },
+  ).lean()
 
   if (expired.length === 0) return { closed: 0, ids: [] }
 
@@ -76,24 +76,29 @@ export async function autoCloseInactiveSessions(
   const ids: string[] = []
 
   for (const row of expired) {
-    const id = row['id'] as string
-    const rawContext = row['context'] as string | null
+    const id = row._id
+    // `context` is Mixed JSON — may be an object, a string (legacy SQLite
+    // rows that hadn't been parsed yet), or null.
     let parsed: Record<string, unknown> = {}
-    try {
-      parsed = rawContext ? (JSON.parse(rawContext) as Record<string, unknown>) : {}
-    } catch {
-      parsed = { raw: rawContext }
+    if (row.context && typeof row.context === 'object' && !Array.isArray(row.context)) {
+      parsed = { ...(row.context as Record<string, unknown>) }
+    } else if (typeof row.context === 'string') {
+      try {
+        parsed = JSON.parse(row.context) as Record<string, unknown>
+      } catch {
+        parsed = { raw: row.context }
+      }
     }
     parsed['autoClosed'] = true
     parsed['autoClosedAt'] = closedAt
     parsed['autoCloseReason'] = `inactive_for_${timeoutMinutes}m`
 
     try {
-      await dbRun(
-        `UPDATE session_handoffs SET status = 'abandoned', context = ? WHERE id = ? AND status = 'active'`,
-        [JSON.stringify(parsed), id],
+      const res = await SessionHandoff.updateOne(
+        { _id: id, status: 'active' },
+        { $set: { status: 'abandoned', context: parsed } },
       )
-      ids.push(id)
+      if (res.modifiedCount > 0) ids.push(id)
     } catch (err) {
       logger.warn(`auto-close failed for ${id}: ${(err as Error).message}`)
     }

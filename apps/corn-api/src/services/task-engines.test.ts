@@ -1,19 +1,21 @@
-// Task Engine Config (S5.2) integration tests. Same pattern as
-// settings.test.ts: tempdir DB + env wired top-level before any
-// import that loads a DB module, single after() teardown.
+// Task Engine Config (S5.2) integration tests. Backed by an in-memory
+// MongoDB replica-set (mongodb-memory-server) so the suite never needs
+// a real mongod and stays parallel-safe across test files.
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import type { MongoMemoryReplSet } from 'mongodb-memory-server'
 
-const tmpDir = mkdtempSync(join(tmpdir(), 'corn-task-engines-test-'))
-process.env['DATABASE_PATH'] = join(tmpDir, 'test.db')
+// Wire env BEFORE the dynamic imports below so any module-level reads
+// (e.g. SYSTEM_SETTINGS_MASTER_KEY) see the right values.
 process.env['SYSTEM_SETTINGS_MASTER_KEY'] = 'unit-test-master-key-do-not-use-in-prod'
 delete process.env['AUTH_JWT_SECRET']
 process.env['TASK_ENGINE_CACHE_TTL_MS'] = '100'
+// Force the test process onto the mongo branch of the driver factory —
+// otherwise initDatabase() would fail looking for a sql.js path.
+process.env['DATABASE_DRIVER'] = 'mongo'
 
+const { setupTestMongo, teardownTestMongo } = await import('../test-utils/mongo.js')
 const {
   DEFAULT_TASK_ENGINES,
   getTaskEngineConfig,
@@ -24,18 +26,17 @@ const {
   appendTaskEngineAudit,
   _clearTaskEngineCacheForTests,
 } = await import('./task-engines.js')
-const { closeDb, flushDb, dbAll, dbRun } = await import('../db/client.js')
+const { TaskEngineConfig: TaskEngineConfigModel, TaskEngineAudit } = await import('../db/mongoose/index.js')
 
-after(async () => {
-  try { await flushDb() } catch { /* best effort */ }
-  try { closeDb() } catch { /* best effort */ }
-  await new Promise((r) => setTimeout(r, 50))
-  if (tmpDir && existsSync(tmpDir)) {
-    rmSync(tmpDir, { recursive: true, force: true })
-  }
+let replSet: MongoMemoryReplSet
+
+before(async () => {
+  replSet = await setupTestMongo()
 })
 
-void before
+after(async () => {
+  await teardownTestMongo(replSet)
+})
 
 // ── 1. Default constant has the 10 expected tasks ──────
 test('DEFAULT_TASK_ENGINES seeds the 10 plan-mandated tasks', () => {
@@ -59,10 +60,11 @@ test('DEFAULT_TASK_ENGINES seeds the 10 plan-mandated tasks', () => {
 
 // ── 2. getTaskEngineConfig synthesizes a default for unknown task ─
 test('getTaskEngineConfig returns synth default for unseeded task', async () => {
+  // Wipe the collection so plan_quality definitely has no DB row.
+  await TaskEngineConfigModel.deleteMany({})
   _clearTaskEngineCacheForTests()
   const cfg = await getTaskEngineConfig('plan_quality')
-  // The 0015 migration seeds plan_quality, but in case the schema mirror
-  // path hit first the synth default is also heuristic.
+  // Synth fallback is heuristic.
   assert.equal(cfg.engine, 'heuristic')
   assert.equal(cfg.task_name, 'plan_quality')
   assert.equal(cfg.fallback_to_heuristic, 1)
@@ -71,8 +73,7 @@ test('getTaskEngineConfig returns synth default for unseeded task', async () => 
 
 // ── 3. seedDefaultTaskEngines is idempotent ────────────
 test('seedDefaultTaskEngines inserts missing rows + skips existing', async () => {
-  // Wipe all rows so we can observe seeding fresh.
-  await dbRun('DELETE FROM task_engine_config', [])
+  await TaskEngineConfigModel.deleteMany({})
   _clearTaskEngineCacheForTests()
 
   const first = await seedDefaultTaskEngines()
@@ -82,8 +83,8 @@ test('seedDefaultTaskEngines inserts missing rows + skips existing', async () =>
   const second = await seedDefaultTaskEngines()
   assert.equal(second.inserted.length, 0)
 
-  const rows = await dbAll('SELECT task_name FROM task_engine_config', [])
-  assert.equal(rows.length, DEFAULT_TASK_ENGINES.length)
+  const count = await TaskEngineConfigModel.countDocuments()
+  assert.equal(count, DEFAULT_TASK_ENGINES.length)
 })
 
 // ── 4. updateTaskEngineConfig flips engine + invalidates cache ─
@@ -137,7 +138,7 @@ test('updateTaskEngineConfig rejects engine value not in (heuristic|llm)', async
 // ── 7. listTaskEngineConfigs surfaces unseeded defaults ─
 test('listTaskEngineConfigs merges DB rows + default seed', async () => {
   // DB only has plan_quality (set by test 4). Wipe everything else.
-  await dbRun('DELETE FROM task_engine_config WHERE task_name != ?', ['plan_quality'])
+  await TaskEngineConfigModel.deleteMany({ _id: { $ne: 'plan_quality' } })
   _clearTaskEngineCacheForTests()
 
   const all = await listTaskEngineConfigs()
@@ -159,7 +160,7 @@ test('listTaskEngineConfigs merges DB rows + default seed', async () => {
 
 // ── 8. updateTaskEngineConfig creates row when missing ─
 test('updateTaskEngineConfig inserts a new row on first edit', async () => {
-  await dbRun('DELETE FROM task_engine_config WHERE task_name = ?', ['memory_dedup'])
+  await TaskEngineConfigModel.deleteMany({ _id: 'memory_dedup' })
   _clearTaskEngineCacheForTests()
 
   const result = await updateTaskEngineConfig('memory_dedup', {
@@ -174,11 +175,8 @@ test('updateTaskEngineConfig inserts a new row on first edit', async () => {
   assert.equal(result.temperature, 0.5)
   assert.equal(result.updated_by, 'admin-user')
 
-  const rows = await dbAll(
-    'SELECT task_name FROM task_engine_config WHERE task_name = ?',
-    ['memory_dedup'],
-  )
-  assert.equal(rows.length, 1)
+  const count = await TaskEngineConfigModel.countDocuments({ _id: 'memory_dedup' })
+  assert.equal(count, 1)
 })
 
 // ── 9. Cache holds within TTL, expires after ──────────
@@ -189,9 +187,9 @@ test('getTaskEngineConfig cache holds within TTL and expires after', async () =>
   assert.equal(v1.engine, 'llm')
 
   // Out-of-band update bypassing the service so the cache stays warm.
-  await dbRun(
-    `UPDATE task_engine_config SET engine = 'heuristic' WHERE task_name = ?`,
-    ['session_summary'],
+  await TaskEngineConfigModel.updateOne(
+    { _id: 'session_summary' },
+    { $set: { engine: 'heuristic' } },
   )
 
   // Within TTL (100ms), still cached value.
@@ -221,14 +219,14 @@ test('updateTaskEngineConfig enabled flag round-trip', async () => {
 test('updateTaskEngineConfig appends audit rows for each changed field', async () => {
   // Wipe audit + reset task to a known baseline so we can count diffs
   // independently of earlier tests.
-  await dbRun('DELETE FROM task_engine_audit', [])
+  await TaskEngineAudit.deleteMany({})
   await updateTaskEngineConfig('quality_report_assist', {
     engine: 'heuristic',
     model: null,
     temperature: 0.2,
     updatedBy: 'baseline',
   })
-  await dbRun('DELETE FROM task_engine_audit', []) // discard baseline diffs
+  await TaskEngineAudit.deleteMany({}) // discard baseline diffs
 
   // Now flip 3 fields in one call.
   await updateTaskEngineConfig('quality_report_assist', {
@@ -255,9 +253,9 @@ test('updateTaskEngineConfig appends audit rows for each changed field', async (
 
 // ── 12. Re-saving the same values writes ZERO audit rows
 test('updateTaskEngineConfig is silent on no-op edits', async () => {
-  await dbRun('DELETE FROM task_engine_audit', [])
+  await TaskEngineAudit.deleteMany({})
   await updateTaskEngineConfig('anomaly_detection', { engine: 'llm', model: 'm1', updatedBy: 'a' })
-  await dbRun('DELETE FROM task_engine_audit', []) // clear that initial diff
+  await TaskEngineAudit.deleteMany({}) // clear that initial diff
 
   // Same values again — nothing should change.
   await updateTaskEngineConfig('anomaly_detection', { engine: 'llm', model: 'm1', updatedBy: 'a' })
@@ -267,7 +265,7 @@ test('updateTaskEngineConfig is silent on no-op edits', async () => {
 
 // ── 13. Audit query: filter by task + limit cap ────────
 test('getTaskEngineAudit filters by taskName and respects limit', async () => {
-  await dbRun('DELETE FROM task_engine_audit', [])
+  await TaskEngineAudit.deleteMany({})
   await updateTaskEngineConfig('token_count', { engine: 'llm', model: 'm1', updatedBy: 'u1' })
   await updateTaskEngineConfig('knowledge_dedup', { engine: 'llm', model: 'm2', updatedBy: 'u2' })
 

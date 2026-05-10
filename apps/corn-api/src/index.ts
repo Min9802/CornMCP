@@ -3,7 +3,8 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger as honoLogger } from 'hono/logger'
 import { createLogger } from '@corn/shared-utils'
-import { getDb, closeDb, flushDb } from './db/client.js'
+import { initDatabase, getActiveDriver, closeDb, flushDb } from './db/client.js'
+import { disconnectMongoose, isMongooseConnected } from './db/mongoose/connection.js'
 import { keysRouter } from './routes/keys.js'
 import { sessionsRouter } from './routes/sessions.js'
 import { qualityRouter } from './routes/quality.js'
@@ -39,7 +40,7 @@ app.use('*', honoLogger())
 
 // ─── Health ─────────────────────────────────────────────
 app.get('/health', async (c) => {
-  async function checkService(name: string, url: string): Promise<'ok' | 'error'> {
+  async function checkService(_name: string, url: string): Promise<'ok' | 'error'> {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(3000) })
       return res.ok ? 'ok' : 'error'
@@ -48,28 +49,43 @@ app.get('/health', async (c) => {
     }
   }
 
-  // Check sqlite (our actual vector store — replaced Qdrant)
-  let sqlite: 'ok' | 'error' = 'ok'
-  try {
-    const { dbGet } = await import('./db/client.js')
-    const row = await dbGet('SELECT COUNT(*) as cnt FROM code_symbols')
-    sqlite = row ? 'ok' : 'error'
-  } catch {
-    sqlite = 'error'
+  // Probe whichever DB driver is active. During cutover the same /health
+  // endpoint serves both backends; flipping DATABASE_DRIVER is enough to
+  // change which probe runs.
+  const driver = getActiveDriver()
+  let dbStatus: 'ok' | 'error' = 'ok'
+  if (driver === 'mongo') {
+    dbStatus = isMongooseConnected() ? 'ok' : 'error'
+  } else {
+    try {
+      const { dbGet } = await import('./db/client.js')
+      const row = await dbGet('SELECT COUNT(*) as cnt FROM code_symbols')
+      dbStatus = row ? 'ok' : 'error'
+    } catch {
+      dbStatus = 'error'
+    }
   }
 
   const mcpUrl = process.env['MCP_URL'] || 'http://localhost:8317'
   const mcp = await checkService('mcp', `${mcpUrl}/health`)
 
-  const allOk = sqlite === 'ok' && mcp === 'ok'
+  const allOk = dbStatus === 'ok' && mcp === 'ok'
 
   return c.json({
-    status: allOk ? 'ok' : (sqlite === 'ok' ? 'degraded' : 'error'),
+    status: allOk ? 'ok' : (dbStatus === 'ok' ? 'degraded' : 'error'),
     service: 'corn-api',
     version: '0.1.0',
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
-    services: { sqlite, api: 'ok' as const, mcp },
+    driver: driver ?? 'uninitialized',
+    services: {
+      // Legacy alias for dashboards that still key off `services.sqlite`.
+      sqlite: driver === 'sqlite' ? dbStatus : (driver === null ? 'error' : 'ok'),
+      mongo: driver === 'mongo' ? dbStatus : 'ok',
+      db: dbStatus,
+      api: 'ok' as const,
+      mcp,
+    },
   })
 })
 
@@ -121,26 +137,33 @@ app.get('/', (c) => {
 const port = Number(process.env['PORT']) || 4000
 
 async function start() {
-  // Initialize database before serving
-  await getDb()
-  logger.info('Database ready')
+  // Initialize database before serving. Routes via DATABASE_DRIVER:
+  //   sqlite → loads sql.js + applies schema/migrations
+  //   mongo  → opens Mongoose connection (initSchemas runs separately)
+  await initDatabase()
+  logger.info(`Database ready (driver=${getActiveDriver()})`)
 
   // ── Task engine seed (S5.1) ────────────────────────────
   // Idempotent — only inserts rows that don't exist. Schema migration
   // 0015 already seeded a fresh DB; this catches the path where the
   // schema mirror in `schema.sql` ran (DDL only, no data) ahead of the
   // migration on a brand-new file.
-  try {
-    const { inserted } = await seedDefaultTaskEngines()
-    if (inserted.length) logger.info(`Task engines seeded: ${inserted.join(', ')}`)
-  } catch (err) {
-    logger.error('Failed to seed task engines:', err)
+  // SQLite-only for now; Mongo seeding lives in `db/mongoose/init.ts`.
+  if (getActiveDriver() === 'sqlite') {
+    try {
+      const { inserted } = await seedDefaultTaskEngines()
+      if (inserted.length) logger.info(`Task engines seeded: ${inserted.join(', ')}`)
+    } catch (err) {
+      logger.error('Failed to seed task engines:', err)
+    }
   }
 
   // ── Session auto-close sweep ────────────────────────────
   // Sessions stuck in 'active' (e.g. agent crashed before corn_session_end)
   // are flipped to 'abandoned' after `SESSION_AUTO_CLOSE_MINUTES` of no
   // activity. PATCH and POST /:id/heartbeat both refresh activity.
+  // Driver-agnostic post-Sprint 2: the lifecycle service now uses the
+  // SessionHandoff Mongoose model, which works under both driver paths.
   const timeoutMinutes = Math.max(
     1,
     Number(process.env['SESSION_AUTO_CLOSE_MINUTES']) || 60,
@@ -159,24 +182,34 @@ async function start() {
   })
 
   // ── Graceful shutdown ───────────────────────────────────
-  // The DB persist layer is debounced (see db/client.ts) so an unflushed
-  // write window exists between dbRun and disk commit. SIGTERM (sent by
-  // docker stop / compose down) and SIGINT must drain that window before we
-  // exit — otherwise the most recent writes are lost.
+  // sqlite path: the persist layer is debounced (see db/client.ts) so an
+  // unflushed write window exists between dbRun and disk commit. SIGTERM
+  // (sent by docker stop / compose down) and SIGINT must drain that window
+  // before we exit — otherwise the most recent writes are lost.
+  // mongo path: nothing to flush (writes go straight to mongod), but we
+  // still close the connection so the driver can drain its socket pool.
   let shuttingDown = false
   const shutdown = async (signal: string) => {
     if (shuttingDown) return
     shuttingDown = true
-    logger.info(`Received ${signal}, flushing DB and shutting down...`)
-    try {
-      await flushDb()
-    } catch (err) {
-      logger.error('Error flushing DB during shutdown:', err)
-    }
-    try {
-      closeDb()
-    } catch (err) {
-      logger.error('Error closing DB during shutdown:', err)
+    logger.info(`Received ${signal}, shutting down (driver=${getActiveDriver()})...`)
+    if (getActiveDriver() === 'sqlite') {
+      try {
+        await flushDb()
+      } catch (err) {
+        logger.error('Error flushing DB during shutdown:', err)
+      }
+      try {
+        closeDb()
+      } catch (err) {
+        logger.error('Error closing DB during shutdown:', err)
+      }
+    } else if (getActiveDriver() === 'mongo') {
+      try {
+        await disconnectMongoose()
+      } catch (err) {
+        logger.error('Error closing Mongo connection during shutdown:', err)
+      }
     }
     server.close(() => process.exit(0))
     // Hard-fail safety: don't hang forever if HTTP sockets won't close.

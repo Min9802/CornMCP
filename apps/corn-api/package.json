@@ -9,7 +9,9 @@
     "start": "node dist/index.js",
     "typecheck": "npx tsc --noEmit",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
-    "migrate:encrypt-keys": "tsx scripts/migrate-encrypt-keys.ts"
+    "migrate:encrypt-keys": "tsx scripts/migrate-encrypt-keys.ts",
+    "init-mongo": "tsx scripts/init-mongo.ts",
+    "migrate:sqlite-to-mongo": "tsx scripts/migrate-sqlite-to-mongo.ts"
   },
   "dependencies": {
     "@corn/shared-mem9": "workspace:*",
@@ -19,6 +21,7 @@
     "bcryptjs": "^2.4.3",
     "hono": "^4.7.0",
     "jose": "^5.9.6",
+    "mongoose": "^9.6.2",
     "nodemailer": "^8.0.4",
     "sql.js": "^1.12.0",
     "typescript": "^5.7.0"
@@ -27,6 +30,7 @@
     "@types/bcryptjs": "^2.4.6",
     "@types/nodemailer": "^7.0.11",
     "@types/sql.js": "^1.4.10",
+    "mongodb-memory-server": "^11.1.0",
     "tsx": "^4.19.0"
   }
 }

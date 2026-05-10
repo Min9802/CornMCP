@@ -20,7 +20,7 @@
 // pass strings from form posts; nonsense values throw before they
 // reach the DB.
 
-import { dbAll, dbGet, dbRun } from '../db/client.js'
+import { TaskEngineConfig as TaskEngineConfigModel, TaskEngineAudit } from '../db/mongoose/index.js'
 
 // ── Default config for the 10 tasks the plan calls out ──
 // Keep ordering aligned with `0015_task_engine_config.sql` seed so the
@@ -204,15 +204,29 @@ async function recordAuditDiff(
   after: Record<string, unknown>,
   changedBy: string,
 ): Promise<void> {
+  const docs: Array<{
+    task_name: string
+    field: string
+    old_value: string | null
+    new_value: string | null
+    action: 'update'
+    changed_by: string
+  }> = []
   for (const field of AUDIT_FIELDS) {
     const oldStr = toAuditValue(before ? before[field] : null)
     const newStr = toAuditValue(after[field])
     if (oldStr === newStr) continue
-    await dbRun(
-      `INSERT INTO task_engine_audit (task_name, field, old_value, new_value, action, changed_by)
-       VALUES (?, ?, ?, ?, 'update', ?)`,
-      [taskName, field, oldStr, newStr, changedBy],
-    )
+    docs.push({
+      task_name: taskName,
+      field,
+      old_value: oldStr,
+      new_value: newStr,
+      action: 'update',
+      changed_by: changedBy,
+    })
+  }
+  if (docs.length > 0) {
+    await TaskEngineAudit.insertMany(docs as Parameters<typeof TaskEngineAudit.insertMany>[0])
   }
 }
 
@@ -234,27 +248,45 @@ export function _clearTaskEngineCacheForTests(): void {
   cache.clear()
 }
 
-// ── Row → typed config ──────────────────────────────────
+// ── Doc → typed config ──────────────────────────────────
 
-function rowToConfig(row: Record<string, unknown>): TaskEngineConfig {
+interface DbDoc {
+  _id: string
+  engine?: string
+  provider_id?: string | null
+  model?: string | null
+  enabled?: boolean
+  fallback_to_heuristic?: boolean
+  prompt_template?: string | null
+  timeout_ms?: number
+  max_input_tokens?: number
+  max_output_tokens?: number
+  temperature?: number
+  cache_ttl_sec?: number
+  cost_cap_usd_per_day?: number
+  description?: string | null
+  updated_by?: string | null
+  updated_at?: Date | string
+}
+
+function docToConfig(doc: DbDoc): TaskEngineConfig {
   return {
-    task_name: row['task_name'] as string,
-    engine: ((row['engine'] as string) === 'llm' ? 'llm' : 'heuristic') as TaskEngineKind,
-    provider_id: (row['provider_id'] as string | null) ?? null,
-    model: (row['model'] as string | null) ?? null,
-    enabled: (row['enabled'] as number) === 0 ? 0 : 1,
-    fallback_to_heuristic:
-      (row['fallback_to_heuristic'] as number) === 0 ? 0 : 1,
-    prompt_template: (row['prompt_template'] as string | null) ?? null,
-    timeout_ms: Number(row['timeout_ms'] ?? 30_000),
-    max_input_tokens: Number(row['max_input_tokens'] ?? 8000),
-    max_output_tokens: Number(row['max_output_tokens'] ?? 1024),
-    temperature: Number(row['temperature'] ?? 0.2),
-    cache_ttl_sec: Number(row['cache_ttl_sec'] ?? 3600),
-    cost_cap_usd_per_day: Number(row['cost_cap_usd_per_day'] ?? 0),
-    description: (row['description'] as string | null) ?? null,
-    updated_by: (row['updated_by'] as string | null) ?? null,
-    updated_at: (row['updated_at'] as string) ?? '',
+    task_name: doc._id,
+    engine: doc.engine === 'llm' ? 'llm' : 'heuristic',
+    provider_id: doc.provider_id ?? null,
+    model: doc.model ?? null,
+    enabled: doc.enabled === false ? 0 : 1,
+    fallback_to_heuristic: doc.fallback_to_heuristic === false ? 0 : 1,
+    prompt_template: doc.prompt_template ?? null,
+    timeout_ms: Number(doc.timeout_ms ?? 30_000),
+    max_input_tokens: Number(doc.max_input_tokens ?? 8000),
+    max_output_tokens: Number(doc.max_output_tokens ?? 1024),
+    temperature: Number(doc.temperature ?? 0.2),
+    cache_ttl_sec: Number(doc.cache_ttl_sec ?? 3600),
+    cost_cap_usd_per_day: Number(doc.cost_cap_usd_per_day ?? 0),
+    description: doc.description ?? null,
+    updated_by: doc.updated_by ?? null,
+    updated_at: doc.updated_at ? new Date(doc.updated_at).toISOString() : '',
   }
 }
 
@@ -281,6 +313,21 @@ function defaultConfigFor(taskName: string): TaskEngineConfig {
   }
 }
 
+// Audit `id` field used to be a SQL INTEGER AUTOINCREMENT; we coerce
+// the Mongo `_id` (Number for migrated rows, ObjectId for new ones)
+// into a stable number so existing dashboard URLs keep working.
+function coerceAuditId(id: unknown): number {
+  if (typeof id === 'number') return id
+  // FNV-1a hash of the ObjectId hex — stable across runs, fits 32-bit.
+  let h = 0x811c9dc5
+  const s = String(id)
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return h >>> 0
+}
+
 // ── Public API ──────────────────────────────────────────
 
 /**
@@ -299,16 +346,8 @@ export async function getTaskEngineConfig(taskName: string): Promise<TaskEngineC
     return hit.value ?? defaultConfigFor(taskName)
   }
 
-  const row = await dbGet(
-    `SELECT task_name, engine, provider_id, model, enabled, fallback_to_heuristic,
-            prompt_template, timeout_ms, max_input_tokens, max_output_tokens,
-            temperature, cache_ttl_sec, cost_cap_usd_per_day, description,
-            updated_by, updated_at
-     FROM task_engine_config WHERE task_name = ?`,
-    [taskName],
-  )
-
-  const value = row ? rowToConfig(row) : null
+  const doc = await TaskEngineConfigModel.findById(taskName).lean<DbDoc | null>()
+  const value = doc ? docToConfig(doc) : null
   cache.set(taskName, { value, expiresAt: now + ttlMs() })
   return value ?? defaultConfigFor(taskName)
 }
@@ -319,16 +358,10 @@ export async function getTaskEngineConfig(taskName: string): Promise<TaskEngineC
  * an admin reset the table).
  */
 export async function listTaskEngineConfigs(): Promise<TaskEngineConfig[]> {
-  const rows = await dbAll(
-    `SELECT task_name, engine, provider_id, model, enabled, fallback_to_heuristic,
-            prompt_template, timeout_ms, max_input_tokens, max_output_tokens,
-            temperature, cache_ttl_sec, cost_cap_usd_per_day, description,
-            updated_by, updated_at
-     FROM task_engine_config ORDER BY task_name ASC`,
-  )
+  const docs = await TaskEngineConfigModel.find({}).sort({ _id: 1 }).lean<DbDoc[]>()
   const byName = new Map<string, TaskEngineConfig>()
-  for (const row of rows) {
-    const cfg = rowToConfig(row)
+  for (const doc of docs) {
+    const cfg = docToConfig(doc)
     byName.set(cfg.task_name, cfg)
   }
   // Surface defaults for any task that hasn't been seeded yet so the UI
@@ -389,126 +422,93 @@ export async function updateTaskEngineConfig(
     throw new Error('costCapUsdPerDay must be ≥ 0')
   }
 
-  const existing = await dbGet(
-    `SELECT task_name, engine, provider_id, model, enabled, fallback_to_heuristic,
-            prompt_template, timeout_ms, max_input_tokens, max_output_tokens,
-            temperature, cache_ttl_sec, cost_cap_usd_per_day, description
-     FROM task_engine_config WHERE task_name = ?`,
-    [taskName],
-  )
+  const existing = await TaskEngineConfigModel.findById(taskName).lean<DbDoc | null>()
 
   // Build the merged row using either the existing DB values or the
   // hardcoded defaults so a brand-new task gets sane numbers without
-  // the admin having to fill every field.
+  // the admin having to fill every field. We diff against the existing
+  // row (or null = creation) for audit so the UI shows actual admin
+  // intent — e.g. "engine: heuristic → llm" not "engine: → llm" on
+  // first edit.
   const fallback = defaultConfigFor(taskName)
   const merged = {
-    engine:
-      patch.engine ?? (existing ? ((existing['engine'] as string) === 'llm' ? 'llm' : 'heuristic') : fallback.engine),
+    engine: patch.engine ?? (existing?.engine === 'llm' ? 'llm' : existing?.engine === 'heuristic' ? 'heuristic' : fallback.engine),
     provider_id:
       patch.providerId === undefined
-        ? ((existing?.['provider_id'] as string | null) ?? fallback.provider_id)
+        ? (existing?.provider_id ?? fallback.provider_id)
         : patch.providerId,
     model:
       patch.model === undefined
-        ? ((existing?.['model'] as string | null) ?? fallback.model)
+        ? (existing?.model ?? fallback.model)
         : patch.model,
     enabled:
       patch.enabled === undefined
-        ? ((existing?.['enabled'] as number | undefined) ?? fallback.enabled)
+        ? (existing?.enabled === false ? 0 : 1)
         : patch.enabled
         ? 1
         : 0,
     fallback_to_heuristic:
       patch.fallbackToHeuristic === undefined
-        ? ((existing?.['fallback_to_heuristic'] as number | undefined) ??
-          fallback.fallback_to_heuristic)
+        ? (existing?.fallback_to_heuristic === false ? 0 : 1)
         : patch.fallbackToHeuristic
         ? 1
         : 0,
     prompt_template:
       patch.promptTemplate === undefined
-        ? ((existing?.['prompt_template'] as string | null) ?? fallback.prompt_template)
+        ? (existing?.prompt_template ?? fallback.prompt_template)
         : patch.promptTemplate,
-    timeout_ms:
-      patch.timeoutMs ?? Number(existing?.['timeout_ms'] ?? fallback.timeout_ms),
+    timeout_ms: patch.timeoutMs ?? Number(existing?.timeout_ms ?? fallback.timeout_ms),
     max_input_tokens:
-      patch.maxInputTokens ??
-      Number(existing?.['max_input_tokens'] ?? fallback.max_input_tokens),
+      patch.maxInputTokens ?? Number(existing?.max_input_tokens ?? fallback.max_input_tokens),
     max_output_tokens:
-      patch.maxOutputTokens ??
-      Number(existing?.['max_output_tokens'] ?? fallback.max_output_tokens),
-    temperature: patch.temperature ?? Number(existing?.['temperature'] ?? fallback.temperature),
+      patch.maxOutputTokens ?? Number(existing?.max_output_tokens ?? fallback.max_output_tokens),
+    temperature: patch.temperature ?? Number(existing?.temperature ?? fallback.temperature),
     cache_ttl_sec:
-      patch.cacheTtlSec ?? Number(existing?.['cache_ttl_sec'] ?? fallback.cache_ttl_sec),
+      patch.cacheTtlSec ?? Number(existing?.cache_ttl_sec ?? fallback.cache_ttl_sec),
     cost_cap_usd_per_day:
       patch.costCapUsdPerDay ??
-      Number(existing?.['cost_cap_usd_per_day'] ?? fallback.cost_cap_usd_per_day),
+      Number(existing?.cost_cap_usd_per_day ?? fallback.cost_cap_usd_per_day),
     description:
       patch.description === undefined
-        ? ((existing?.['description'] as string | null) ?? fallback.description)
+        ? (existing?.description ?? fallback.description)
         : patch.description,
   }
 
-  if (existing) {
-    await dbRun(
-      `UPDATE task_engine_config SET
-         engine = ?, provider_id = ?, model = ?, enabled = ?,
-         fallback_to_heuristic = ?, prompt_template = ?, timeout_ms = ?,
-         max_input_tokens = ?, max_output_tokens = ?, temperature = ?,
-         cache_ttl_sec = ?, cost_cap_usd_per_day = ?, description = ?,
-         updated_by = ?, updated_at = datetime('now')
-       WHERE task_name = ?`,
-      [
-        merged.engine,
-        merged.provider_id,
-        merged.model,
-        merged.enabled,
-        merged.fallback_to_heuristic,
-        merged.prompt_template,
-        merged.timeout_ms,
-        merged.max_input_tokens,
-        merged.max_output_tokens,
-        merged.temperature,
-        merged.cache_ttl_sec,
-        merged.cost_cap_usd_per_day,
-        merged.description,
-        patch.updatedBy ?? 'system',
-        taskName,
-      ],
-    )
-  } else {
-    await dbRun(
-      `INSERT INTO task_engine_config
-         (task_name, engine, provider_id, model, enabled,
-          fallback_to_heuristic, prompt_template, timeout_ms,
-          max_input_tokens, max_output_tokens, temperature,
-          cache_ttl_sec, cost_cap_usd_per_day, description, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        taskName,
-        merged.engine,
-        merged.provider_id,
-        merged.model,
-        merged.enabled,
-        merged.fallback_to_heuristic,
-        merged.prompt_template,
-        merged.timeout_ms,
-        merged.max_input_tokens,
-        merged.max_output_tokens,
-        merged.temperature,
-        merged.cache_ttl_sec,
-        merged.cost_cap_usd_per_day,
-        merged.description,
-        patch.updatedBy ?? 'system',
-      ],
-    )
-  }
+  await TaskEngineConfigModel.findOneAndUpdate(
+    { _id: taskName },
+    {
+      $set: {
+        engine: merged.engine,
+        provider_id: merged.provider_id,
+        model: merged.model,
+        // Schema stores booleans; legacy SQL had 0/1 ints.
+        enabled: merged.enabled === 1,
+        fallback_to_heuristic: merged.fallback_to_heuristic === 1,
+        prompt_template: merged.prompt_template,
+        timeout_ms: merged.timeout_ms,
+        max_input_tokens: merged.max_input_tokens,
+        max_output_tokens: merged.max_output_tokens,
+        temperature: merged.temperature,
+        cache_ttl_sec: merged.cache_ttl_sec,
+        cost_cap_usd_per_day: merged.cost_cap_usd_per_day,
+        description: merged.description,
+        updated_by: patch.updatedBy ?? 'system',
+      },
+    },
+    { upsert: true, setDefaultsOnInsert: true },
+  )
 
-  // Append per-field audit rows AFTER the write succeeds. We deliberately
-  // diff against the existing row (or null = creation) rather than the
-  // hardcoded fallback so audit shows actual admin intent — e.g. "engine:
-  // heuristic → llm" not "engine: → llm" on first edit.
-  await recordAuditDiff(taskName, existing ?? null, merged, patch.updatedBy ?? 'system')
+  // Append per-field audit rows AFTER the write succeeds. Audit `enabled`
+  // and `fallback_to_heuristic` as 0/1 strings to match the legacy SQL
+  // contract (SQLite INTEGER columns produced '0'/'1' strings).
+  const beforeForAudit: Record<string, unknown> | null = existing
+    ? {
+        ...existing,
+        enabled: existing.enabled === false ? 0 : 1,
+        fallback_to_heuristic: existing.fallback_to_heuristic === false ? 0 : 1,
+      }
+    : null
+  await recordAuditDiff(taskName, beforeForAudit, merged, patch.updatedBy ?? 'system')
 
   cache.delete(taskName)
   return getTaskEngineConfig(taskName)
@@ -523,31 +523,21 @@ export async function getTaskEngineAudit(
   opts: { taskName?: string; limit?: number } = {},
 ): Promise<TaskEngineAuditEntry[]> {
   const limit = Math.min(Math.max(Number(opts.limit) || 50, 1), 500)
-  const rows = opts.taskName
-    ? await dbAll(
-        `SELECT id, task_name, field, old_value, new_value, action, changed_by, changed_at
-         FROM task_engine_audit
-         WHERE task_name = ?
-         ORDER BY changed_at DESC, id DESC
-         LIMIT ?`,
-        [opts.taskName, limit],
-      )
-    : await dbAll(
-        `SELECT id, task_name, field, old_value, new_value, action, changed_by, changed_at
-         FROM task_engine_audit
-         ORDER BY changed_at DESC, id DESC
-         LIMIT ?`,
-        [limit],
-      )
+  const filter = opts.taskName ? { task_name: opts.taskName } : {}
+  const rows = await TaskEngineAudit.find(filter)
+    .sort({ changed_at: -1, _id: -1 })
+    .limit(limit)
+    .lean()
+
   return rows.map((r) => ({
-    id: Number(r['id']),
-    task_name: (r['task_name'] as string) ?? '',
-    field: (r['field'] as string) ?? '',
-    old_value: (r['old_value'] as string | null) ?? null,
-    new_value: (r['new_value'] as string | null) ?? null,
-    action: ((r['action'] as string) === 'test' || r['action'] === 'reset' ? r['action'] : 'update') as TaskEngineAuditAction,
-    changed_by: (r['changed_by'] as string | null) ?? null,
-    changed_at: (r['changed_at'] as string) ?? '',
+    id: coerceAuditId(r._id),
+    task_name: r.task_name ?? '',
+    field: r.field ?? '',
+    old_value: r.old_value ?? null,
+    new_value: r.new_value ?? null,
+    action: (r.action === 'test' || r.action === 'reset' ? r.action : 'update') as TaskEngineAuditAction,
+    changed_by: r.changed_by ?? null,
+    changed_at: r.changed_at ? new Date(r.changed_at).toISOString() : '',
   }))
 }
 
@@ -565,11 +555,14 @@ export async function appendTaskEngineAudit(
   action: TaskEngineAuditAction,
   changedBy: string,
 ): Promise<void> {
-  await dbRun(
-    `INSERT INTO task_engine_audit (task_name, field, old_value, new_value, action, changed_by)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [taskName, field, oldValue, newValue, action, changedBy],
-  )
+  await TaskEngineAudit.create({
+    task_name: taskName,
+    field,
+    old_value: oldValue,
+    new_value: newValue,
+    action,
+    changed_by: changedBy,
+  } as Parameters<typeof TaskEngineAudit.create>[0])
 }
 
 /**
@@ -582,21 +575,15 @@ export async function appendTaskEngineAudit(
 export async function seedDefaultTaskEngines(): Promise<{ inserted: string[] }> {
   const inserted: string[] = []
   for (const spec of DEFAULT_TASK_ENGINES) {
-    const existing = await dbGet(
-      'SELECT task_name FROM task_engine_config WHERE task_name = ?',
-      [spec.taskName],
-    )
+    const existing = await TaskEngineConfigModel.findById(spec.taskName, { _id: 1 }).lean()
     if (existing) continue
-    await dbRun(
-      `INSERT INTO task_engine_config (task_name, engine, description, model, max_output_tokens)
-       VALUES (?, 'heuristic', ?, ?, ?)`,
-      [
-        spec.taskName,
-        spec.description,
-        spec.suggestedModel ?? null,
-        spec.maxOutputTokens ?? 1024,
-      ],
-    )
+    await TaskEngineConfigModel.create({
+      _id: spec.taskName,
+      engine: 'heuristic',
+      description: spec.description,
+      model: spec.suggestedModel ?? null,
+      max_output_tokens: spec.maxOutputTokens ?? 1024,
+    } as Parameters<typeof TaskEngineConfigModel.create>[0])
     inserted.push(spec.taskName)
   }
   return { inserted }

@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
-import { dbAll, dbGet, dbRun } from '../db/client.js'
+import type { QueryFilter } from 'mongoose'
+import { KnowledgeDocument, type KnowledgeDocumentDoc } from '../db/mongoose/index.js'
 import { generateId } from '@corn/shared-utils'
 import { jwtAuthMiddleware, anyAuthMiddleware, getAuthCtx, getAgentCtx } from '../middleware/auth.js'
 
@@ -10,28 +11,23 @@ knowledgeRouter.get('/', jwtAuthMiddleware, async (c) => {
   const limit = Number(c.req.query('limit') || '50')
   const projectId = c.req.query('projectId')
 
-  let query = 'SELECT * FROM knowledge_documents'
-  const params: unknown[] = []
+  const filter: QueryFilter<KnowledgeDocumentDoc> = {}
 
   if (user.role !== 'admin') {
-    const conditions: string[] = ['user_id = ?']
-    params.push(user.id)
-    if (projectIds.length > 0) {
-      conditions.push(`project_id IN (${projectIds.map(() => '?').join(',')})`)
-      params.push(...projectIds)
-    }
-    query += ` WHERE (${conditions.join(' OR ')})`
-    if (projectId) { query += ' AND project_id = ?'; params.push(projectId) }
-  } else if (projectId) {
-    query += ' WHERE project_id = ?'
-    params.push(projectId)
+    // Ownership: own document OR document belongs to an accessible project.
+    const owners: QueryFilter<KnowledgeDocumentDoc>[] = [{ user_id: user.id }]
+    if (projectIds.length > 0) owners.push({ project_id: { $in: projectIds } })
+    filter.$or = owners
   }
 
-  query += ' ORDER BY created_at DESC LIMIT ?'
-  params.push(limit)
+  if (projectId) filter.project_id = projectId
 
-  const docs = await dbAll(query, params)
-  return c.json({ documents: docs })
+  const documents = await KnowledgeDocument.find(filter)
+    .sort({ created_at: -1 })
+    .limit(limit)
+    .lean()
+
+  return c.json({ documents })
 })
 
 knowledgeRouter.post('/', anyAuthMiddleware, async (c) => {
@@ -51,19 +47,24 @@ knowledgeRouter.post('/', anyAuthMiddleware, async (c) => {
     }
   }
 
-  await dbRun(
-    `INSERT OR REPLACE INTO knowledge_documents (id, title, source, source_agent_id, project_id, tags, status, content_preview, user_id)
-     VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
-    [
-      id,
-      body.title,
-      body.source || 'manual',
-      body.sourceAgentId || null,
-      body.projectId || null,
-      JSON.stringify(body.tags || []),
-      (body.content || '').slice(0, 200),
-      userId,
-    ],
+  // Mongo equivalent of `INSERT OR REPLACE`: keep created_at + hit_count + chunk_count
+  // intact across upserts.
+  await KnowledgeDocument.findOneAndUpdate(
+    { _id: id },
+    {
+      $set: {
+        title: body.title,
+        source: body.source || 'manual',
+        source_agent_id: body.sourceAgentId || null,
+        project_id: body.projectId || null,
+        tags: body.tags || [],
+        status: 'active',
+        content_preview: (body.content || '').slice(0, 200),
+        user_id: userId,
+      },
+      $setOnInsert: { _id: id, hit_count: 0, chunk_count: 0 },
+    },
+    { upsert: true, setDefaultsOnInsert: true, new: true },
   )
 
   return c.json({ ok: true, id })
@@ -72,30 +73,34 @@ knowledgeRouter.post('/', anyAuthMiddleware, async (c) => {
 knowledgeRouter.get('/:id', jwtAuthMiddleware, async (c) => {
   const { id } = c.req.param()
   const { user, projectIds } = getAuthCtx(c)
-  const doc = await dbGet('SELECT * FROM knowledge_documents WHERE id = ?', [id])
-  if (!doc) return c.json({ error: 'Not found' }, 404)
+  const document = await KnowledgeDocument.findById(id).lean()
+  if (!document) return c.json({ error: 'Not found' }, 404)
 
   // Access check for non-admin
   if (user.role !== 'admin') {
-    const owned = doc['user_id'] === user.id || (doc['project_id'] && projectIds.includes(doc['project_id'] as string))
+    const owned = document.user_id === user.id
+      || (document.project_id && projectIds.includes(document.project_id))
     if (!owned) return c.json({ error: 'Access denied' }, 403)
   }
 
-  await dbRun('UPDATE knowledge_documents SET hit_count = hit_count + 1 WHERE id = ?', [id])
-  return c.json({ document: doc })
+  await KnowledgeDocument.updateOne({ _id: id }, { $inc: { hit_count: 1 } })
+  return c.json({ document })
 })
 
 knowledgeRouter.delete('/:id', jwtAuthMiddleware, async (c) => {
   const { id } = c.req.param()
   const { user } = getAuthCtx(c)
 
-  if (user.role !== 'admin') {
-    const doc = await dbGet('SELECT user_id FROM knowledge_documents WHERE id = ?', [id])
-    if (!doc) return c.json({ error: 'Not found' }, 404)
-    if (doc['user_id'] !== user.id) return c.json({ error: 'Access denied' }, 403)
+  // Load the document instance so the schema's pre('deleteOne') middleware
+  // (which cascades to KnowledgeChunk) can fire.
+  const doc = await KnowledgeDocument.findById(id)
+  if (!doc) return c.json({ error: 'Not found' }, 404)
+
+  if (user.role !== 'admin' && doc.user_id !== user.id) {
+    return c.json({ error: 'Access denied' }, 403)
   }
 
-  await dbRun('DELETE FROM knowledge_documents WHERE id = ?', [id])
+  await doc.deleteOne()
   return c.json({ ok: true })
 })
 

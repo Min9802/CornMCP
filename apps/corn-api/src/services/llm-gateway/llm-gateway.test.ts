@@ -1,8 +1,7 @@
-// LLM Gateway integration tests (S4.8). Same fixture pattern as
-// settings.test.ts: real sql.js DB on a tempdir, env wired before any
-// import. Providers are exercised via a swappable `fetchImpl` so we
-// can deterministically return shape-specific responses per test
-// without hitting the network.
+// LLM Gateway integration tests (S4.8). Backed by an in-memory MongoDB
+// replica-set (mongodb-memory-server). Providers are exercised via a
+// swappable `fetchImpl` so we can deterministically return shape-specific
+// responses per test without hitting the network.
 //
 // Coverage summary (15+):
 //  1.  OpenAI happy path + provider-reported tokens
@@ -23,32 +22,27 @@
 // 16.  query_logs row emitted after successful call
 // 17.  Token estimation fallback when provider omits usage
 
-import { test, after } from 'node:test'
+import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import type { MongoMemoryReplSet } from 'mongodb-memory-server'
 
-// Env wiring BEFORE any DB/secrets/llm-gateway import (see
-// settings.test.ts header — node:test runs `before()` after module
-// evaluation, so we can't defer this).
-const tmpDir = mkdtempSync(join(tmpdir(), 'corn-llm-gateway-test-'))
-process.env['DATABASE_PATH'] = join(tmpDir, 'test.db')
+// Env wiring BEFORE any DB/secrets/llm-gateway import.
 process.env['SYSTEM_SETTINGS_MASTER_KEY'] = 'unit-test-master-key-do-not-use-in-prod'
 delete process.env['AUTH_JWT_SECRET']
-// Short setting cache TTL so test-time setSetting changes propagate fast.
 process.env['SYSTEM_SETTINGS_CACHE_TTL_MS'] = '50'
+process.env['DATABASE_DRIVER'] = 'mongo'
 // Clear any real provider env vars — tests set them explicitly per case.
 delete process.env['OPENAI_API_KEY']
 delete process.env['ANTHROPIC_API_KEY']
 delete process.env['GEMINI_API_KEY']
 
+const { setupTestMongo, teardownTestMongo } = await import('../../test-utils/mongo.js')
 const { _resetKeyCacheForTests } = await import('../secrets.js')
 const { _clearSettingsCacheForTests, setSetting } = await import('../settings.js')
-const { dbRun, closeDb, flushDb } = await import('../../db/client.js')
 const { _resetCacheForTests } = await import('./cache.js')
 const { _resetCostCapCacheForTests } = await import('./cost.js')
 const { _resetProviderLoaderForTests } = await import('./provider-loader.js')
+const { LlmGatewayLog, ProviderAccount, QueryLog } = await import('../../db/mongoose/index.js')
 const {
   chatComplete,
   CostCapExceededError,
@@ -59,6 +53,16 @@ const {
 } = await import('./index.js')
 
 _resetKeyCacheForTests()
+
+let replSet: MongoMemoryReplSet
+
+before(async () => {
+  replSet = await setupTestMongo()
+})
+
+after(async () => {
+  await teardownTestMongo(replSet)
+})
 
 // ── Test helpers ────────────────────────────────────────
 interface FetchFixture {
@@ -80,8 +84,6 @@ function makeFetch(fixtures: FetchFixture[]): {
   callLog: Array<{ url: string; init: RequestInit | undefined }>
 } {
   const state = { calls: 0, callLog: [] as Array<{ url: string; init: RequestInit | undefined }> }
-  // `RequestInfo` isn't surfaced in this tsconfig's DOM lib subset; accept
-  // the runtime signature directly.
   const fetchImpl = (async (input: unknown, init?: RequestInit) => {
     state.calls += 1
     const url = typeof input === 'string' ? input : String(input)
@@ -93,16 +95,12 @@ function makeFetch(fixtures: FetchFixture[]): {
     fixture.onCall?.(url, init)
 
     if (fixture.hang) {
-      // Reject when the caller's AbortSignal fires — emulates a real
-      // fetch that stalls until the timeout aborts it.
       return await new Promise<Response>((_, reject) => {
         const signal = init?.signal as AbortSignal | undefined
         if (!signal) return
         signal.addEventListener(
           'abort',
           () => {
-            // `AbortSignal.timeout` surfaces as `TimeoutError` in Node ≥20;
-            // we mirror that name so the adapter's branch triggers.
             const err = new Error('aborted by timeout signal')
             err.name = 'TimeoutError'
             reject(err)
@@ -175,17 +173,6 @@ async function seedSettings(kv: Record<string, string | null>, isSecretKeys: str
   }
   _clearSettingsCacheForTests()
 }
-
-// Single teardown — drain the sql.js writer before rm (same dance as
-// settings.test.ts, see that header for why order matters).
-after(async () => {
-  try { await flushDb() } catch { /* best effort */ }
-  try { closeDb() } catch { /* best effort */ }
-  await new Promise((r) => setTimeout(r, 50))
-  if (tmpDir && existsSync(tmpDir)) {
-    rmSync(tmpDir, { recursive: true, force: true })
-  }
-})
 
 // ── 1. OpenAI happy path ────────────────────────────────
 test('OpenAI adapter — happy path with provider-reported tokens', async () => {
@@ -380,10 +367,13 @@ test('Cost cap — throws CostCapExceededError when daily spend ≥ cap', async 
   resetAll()
   process.env['OPENAI_API_KEY'] = 'sk-cap'
   // Seed an existing $2 spend today to blow through the $1 default cap.
-  await dbRun(
-    `INSERT INTO llm_gateway_logs (task_name, provider, model, cost_usd, created_at)
-     VALUES ('seed', 'openai', 'gpt-4o-mini', 2.0, datetime('now'))`,
-  )
+  await LlmGatewayLog.create({
+    task_name: 'seed',
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    cost_usd: 2.0,
+    error: null,
+  } as Parameters<typeof LlmGatewayLog.create>[0])
   _resetCostCapCacheForTests()
 
   const fx = makeFetch([
@@ -400,7 +390,7 @@ test('Cost cap — throws CostCapExceededError when daily spend ≥ cap', async 
   assert.equal(fx.calls, 0, 'cap must short-circuit before any fetch')
 
   // Clean up so later tests don't trip the cap.
-  await dbRun(`DELETE FROM llm_gateway_logs WHERE task_name = 'seed'`)
+  await LlmGatewayLog.deleteMany({ task_name: 'seed' })
   _resetCostCapCacheForTests()
   delete process.env['OPENAI_API_KEY']
 })
@@ -479,16 +469,26 @@ test('Fallback chain — primary 500 falls through to secondary', async () => {
   process.env['GEMINI_API_KEY'] = 'AIza-fallback-secondary'
 
   // Seed a real DB row for each so the chain can point by id.
-  await dbRun(
-    `INSERT INTO provider_accounts (id, name, type, api_base, api_key, api_key_encrypted, status)
-     VALUES ('prov-primary', 'P1', 'openai', 'https://api.openai.com/v1', ?, 0, 'enabled')`,
-    ['sk-primary-direct'],
-  )
-  await dbRun(
-    `INSERT INTO provider_accounts (id, name, type, api_base, api_key, api_key_encrypted, status)
-     VALUES ('prov-secondary', 'P2', 'gemini', 'https://generativelanguage.googleapis.com/v1beta', ?, 0, 'enabled')`,
-    ['gemini-direct'],
-  )
+  await ProviderAccount.create([
+    {
+      _id: 'prov-primary',
+      name: 'P1',
+      type: 'openai',
+      api_base: 'https://api.openai.com/v1',
+      api_key: 'sk-primary-direct',
+      api_key_encrypted: false,
+      status: 'enabled',
+    },
+    {
+      _id: 'prov-secondary',
+      name: 'P2',
+      type: 'gemini',
+      api_base: 'https://generativelanguage.googleapis.com/v1beta',
+      api_key: 'gemini-direct',
+      api_key_encrypted: false,
+      status: 'enabled',
+    },
+  ] as unknown as Parameters<typeof ProviderAccount.create>[0])
   await seedSettings({
     'llm.fallback_chain': JSON.stringify(['prov-secondary']),
   })
@@ -511,7 +511,7 @@ test('Fallback chain — primary 500 falls through to secondary', async () => {
   assert.equal(fx.calls, 2)
 
   // Clean up.
-  await dbRun(`DELETE FROM provider_accounts WHERE id IN ('prov-primary', 'prov-secondary')`)
+  await ProviderAccount.deleteMany({ _id: { $in: ['prov-primary', 'prov-secondary'] } })
   await setSetting('llm.fallback_chain', null)
   delete process.env['OPENAI_API_KEY']
   delete process.env['GEMINI_API_KEY']
@@ -561,11 +561,15 @@ test('llm.disable_env_fallback=true — blocks virtual chain even with env keys'
 test('Admin row for same type — wins over virtual env fallback', async () => {
   resetAll()
   process.env['OPENAI_API_KEY'] = 'sk-env-shouldnt-win'
-  await dbRun(
-    `INSERT INTO provider_accounts (id, name, type, api_base, api_key, api_key_encrypted, status)
-     VALUES ('prov-real-openai', 'RealO', 'openai', 'https://real.example.com/v1', ?, 0, 'enabled')`,
-    ['sk-real-admin'],
-  )
+  await ProviderAccount.create({
+    _id: 'prov-real-openai',
+    name: 'RealO',
+    type: 'openai',
+    api_base: 'https://real.example.com/v1',
+    api_key: 'sk-real-admin',
+    api_key_encrypted: false,
+    status: 'enabled',
+  } as Parameters<typeof ProviderAccount.create>[0])
 
   let capturedUrl = ''
   const fx = makeFetch([
@@ -583,7 +587,7 @@ test('Admin row for same type — wins over virtual env fallback', async () => {
   assert.notEqual(resp.providerId, 'env:openai')
   assert.ok(capturedUrl.includes('real.example.com'), `hit ${capturedUrl}`)
 
-  await dbRun(`DELETE FROM provider_accounts WHERE id = 'prov-real-openai'`)
+  await ProviderAccount.deleteMany({ _id: 'prov-real-openai' })
   delete process.env['OPENAI_API_KEY']
 })
 
@@ -595,9 +599,7 @@ test('query_logs — row written for successful call', async () => {
     { match: 'api.openai.com', body: openaiOk('logged-x', 7, 3) },
   ])
 
-  const before = await (await import('../../db/client.js')).dbGet(
-    `SELECT COUNT(*) as n FROM query_logs WHERE tool = 'llm_gateway'`,
-  )
+  const before = await QueryLog.countDocuments({ tool: 'llm_gateway' })
   await chatComplete(
     {
       provider: 'openai',
@@ -608,21 +610,16 @@ test('query_logs — row written for successful call', async () => {
     { fetchImpl: fx.fetchImpl },
   )
   // Fire-and-forget write — give the event loop a tick.
-  await new Promise((r) => setTimeout(r, 20))
+  await new Promise((r) => setTimeout(r, 50))
 
-  const after = await (await import('../../db/client.js')).dbGet(
-    `SELECT COUNT(*) as n FROM query_logs WHERE tool = 'llm_gateway'`,
-  )
-  assert.equal(Number(after?.['n']), Number(before?.['n']) + 1)
+  const after = await QueryLog.countDocuments({ tool: 'llm_gateway' })
+  assert.equal(after, before + 1)
 
-  const row = await (await import('../../db/client.js')).dbGet(
-    `SELECT agent_id, tool, compute_tokens, compute_model FROM query_logs
-     WHERE tool = 'llm_gateway' ORDER BY id DESC LIMIT 1`,
-  )
-  assert.equal(row?.['tool'], 'llm_gateway')
-  assert.equal(row?.['agent_id'], 'test_querylog')
-  assert.equal(Number(row?.['compute_tokens']), 10)
-  assert.equal(row?.['compute_model'], 'gpt-4o-mini')
+  const row = await QueryLog.findOne({ tool: 'llm_gateway' }).sort({ created_at: -1 }).lean()
+  assert.equal(row?.tool, 'llm_gateway')
+  assert.equal(row?.agent_id, 'test_querylog')
+  assert.equal(Number(row?.compute_tokens), 10)
+  assert.equal(row?.compute_model, 'gpt-4o-mini')
 
   delete process.env['OPENAI_API_KEY']
 })

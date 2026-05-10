@@ -1,6 +1,10 @@
-import { Hono } from 'hono'
-import { dbAll, dbGet, dbRun } from '../db/client.js'
+// Project + organization CRUD. Mongoose-backed. Ownership enforcement
+// continues to use organizations.user_id (a column added by SQLite
+// migration 0001 that we've mirrored on the Mongo schema).
+
+import { Hono, type Context } from 'hono'
 import { generateId } from '@corn/shared-utils'
+import { Project, Organization } from '../db/mongoose/index.js'
 import { jwtAuthMiddleware, getAuthCtx } from '../middleware/auth.js'
 
 export const projectsRouter = new Hono()
@@ -10,15 +14,22 @@ projectsRouter.use('*', jwtAuthMiddleware)
 projectsRouter.get('/', async (c) => {
   const { user, projectIds } = getAuthCtx(c)
 
-  const projects = user.role === 'admin'
-    ? await dbAll('SELECT * FROM projects ORDER BY created_at DESC')
-    : projectIds.length > 0
-    ? await dbAll(
-        `SELECT * FROM projects WHERE id IN (${projectIds.map(() => '?').join(',')}) ORDER BY created_at DESC`,
-        projectIds,
-      )
-    : []
+  let docs: unknown[]
+  if (user.role === 'admin') {
+    docs = await Project.find({}).sort({ created_at: -1 }).lean()
+  } else if (projectIds.length > 0) {
+    docs = await Project.find({ _id: { $in: projectIds } })
+      .sort({ created_at: -1 })
+      .lean()
+  } else {
+    docs = []
+  }
 
+  // Preserve the legacy `id` shape consumed by the dashboard.
+  const projects = (docs as Array<Record<string, unknown> & { _id: string }>).map((d) => ({
+    ...d,
+    id: d._id,
+  }))
   return c.json({ projects })
 })
 
@@ -27,42 +38,39 @@ projectsRouter.post('/', async (c) => {
   const { user } = getAuthCtx(c)
   const id = generateId('proj')
   const slug = (body.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
+  const orgId = body.orgId || 'org-default'
 
-  // Verify org belongs to user (non-admin)
+  // Verify org belongs to user (non-admin).
   if (user.role !== 'admin' && body.orgId) {
-    const org = await dbGet('SELECT user_id FROM organizations WHERE id = ?', [body.orgId])
-    if (!org || org['user_id'] !== user.id) {
+    const org = await Organization.findById(body.orgId, { user_id: 1 }).lean()
+    if (!org || org.user_id !== user.id) {
       return c.json({ error: 'Organization not found or access denied' }, 403)
     }
   }
 
-  await dbRun(
-    `INSERT INTO projects (id, org_id, name, slug, description, git_repo_url, git_provider)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [
-      id,
-      body.orgId || 'org-default',
-      body.name,
-      slug,
-      body.description || null,
-      body.gitRepoUrl || null,
-      body.gitProvider || null,
-    ],
-  )
+  await Project.create({
+    _id: id,
+    org_id: orgId,
+    name: body.name,
+    slug,
+    description: body.description ?? null,
+    git_repo_url: body.gitRepoUrl ?? null,
+    git_provider: body.gitProvider ?? null,
+  } as Parameters<typeof Project.create>[0])
 
   return c.json({ ok: true, id })
 })
 
-// Check project ownership (non-admin must own the org that owns the project)
-async function assertProjectAccess(c: any, projectId: string) {
+// Check project ownership (non-admin must own the org that owns the project).
+async function assertProjectAccess(c: Context, projectId: string) {
   const { user } = getAuthCtx(c)
-  const project = await dbGet('SELECT org_id FROM projects WHERE id = ?', [projectId])
+  const project = await Project.findById(projectId, { org_id: 1 }).lean()
   if (!project) {
     return { ok: false as const, response: c.json({ error: 'Project not found' }, 404) }
   }
   if (user.role !== 'admin') {
-    const org = await dbGet('SELECT user_id FROM organizations WHERE id = ?', [project['org_id']])
-    if (!org || org['user_id'] !== user.id) {
+    const org = await Organization.findById(project.org_id, { user_id: 1 }).lean()
+    if (!org || org.user_id !== user.id) {
       return { ok: false as const, response: c.json({ error: 'Access denied' }, 403) }
     }
   }
@@ -80,11 +88,16 @@ projectsRouter.put('/:id', async (c) => {
   }
 
   const slug = String(body.name).toLowerCase().replace(/[^a-z0-9]+/g, '-')
-  await dbRun(
-    `UPDATE projects
-     SET name = ?, slug = ?, description = ?, git_repo_url = ?, updated_at = datetime('now')
-     WHERE id = ?`,
-    [body.name, slug, body.description || null, body.gitRepoUrl || null, id],
+  await Project.updateOne(
+    { _id: id },
+    {
+      $set: {
+        name: body.name,
+        slug,
+        description: body.description ?? null,
+        git_repo_url: body.gitRepoUrl ?? null,
+      },
+    },
   )
 
   return c.json({ ok: true })
@@ -95,16 +108,16 @@ projectsRouter.delete('/:id', async (c) => {
   const access = await assertProjectAccess(c, id)
   if (!access.ok) return access.response
 
-  // Manual cascade: PRAGMA foreign_keys is OFF in sql.js, so CASCADE rules
-  // declared in schema won't fire. Clean up hard-dependent rows explicitly.
-  // Nullable/historical refs (usage_logs, query_logs, quality_reports,
-  // knowledge_documents, api_keys, agent_queue) are intentionally kept for audit.
-  await dbRun('DELETE FROM code_edges WHERE project_id = ?', [id])
-  await dbRun('DELETE FROM code_symbols WHERE project_id = ?', [id])
-  await dbRun('DELETE FROM index_jobs WHERE project_id = ?', [id])
-  await dbRun('DELETE FROM change_events WHERE project_id = ?', [id])
-  await dbRun('DELETE FROM agent_ack WHERE project_id = ?', [id])
-  await dbRun('DELETE FROM projects WHERE id = ?', [id])
+  // Load the doc so the schema-level cascade middleware fires:
+  //   Project.pre('deleteOne', { document: true }) tears down code_*,
+  //   index_jobs, change_events, agent_ack, agent_memories,
+  //   quality_reports, session_handoffs, knowledge_documents (which in
+  //   turn cascades to knowledge_chunks).
+  // Wrapped in a transaction inside the middleware itself.
+  const project = await Project.findById(id)
+  if (!project) return c.json({ error: 'Project not found' }, 404)
+  await project.deleteOne()
+
   return c.json({ ok: true })
 })
 
@@ -115,14 +128,10 @@ orgsRouter.use('*', jwtAuthMiddleware)
 orgsRouter.get('/', async (c) => {
   const { user } = getAuthCtx(c)
 
-  const orgs = user.role === 'admin'
-    ? await dbAll('SELECT * FROM organizations ORDER BY created_at DESC')
-    : await dbAll(
-        'SELECT * FROM organizations WHERE user_id = ? ORDER BY created_at DESC',
-        [user.id],
-      )
-
-  return c.json({ organizations: orgs })
+  const filter = user.role === 'admin' ? {} : { user_id: user.id }
+  const docs = await Organization.find(filter).sort({ created_at: -1 }).lean()
+  const organizations = docs.map((d) => ({ ...d, id: d._id }))
+  return c.json({ organizations })
 })
 
 orgsRouter.post('/', async (c) => {
@@ -131,10 +140,13 @@ orgsRouter.post('/', async (c) => {
   const id = generateId('org')
   const slug = (body.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
 
-  await dbRun(
-    `INSERT INTO organizations (id, name, slug, description, user_id) VALUES (?, ?, ?, ?, ?)`,
-    [id, body.name, slug, body.description || null, user.id],
-  )
+  await Organization.create({
+    _id: id,
+    name: body.name,
+    slug,
+    description: body.description ?? null,
+    user_id: user.id,
+  } as Parameters<typeof Organization.create>[0])
 
   return c.json({ ok: true, id })
 })
@@ -146,16 +158,16 @@ orgsRouter.put('/:id', async (c) => {
 
   // Check ownership
   if (user.role !== 'admin') {
-    const org = await dbGet('SELECT user_id FROM organizations WHERE id = ?', [id])
-    if (!org || org['user_id'] !== user.id) {
+    const org = await Organization.findById(id, { user_id: 1 }).lean()
+    if (!org || org.user_id !== user.id) {
       return c.json({ error: 'Access denied' }, 403)
     }
   }
 
   const slug = (body.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
-  await dbRun(
-    'UPDATE organizations SET name = ?, slug = ?, description = ? WHERE id = ?',
-    [body.name, slug, body.description || null, id],
+  await Organization.updateOne(
+    { _id: id },
+    { $set: { name: body.name, slug, description: body.description ?? null } },
   )
 
   return c.json({ ok: true })
@@ -167,12 +179,12 @@ orgsRouter.delete('/:id', async (c) => {
 
   // Check ownership
   if (user.role !== 'admin') {
-    const org = await dbGet('SELECT user_id FROM organizations WHERE id = ?', [id])
-    if (!org || org['user_id'] !== user.id) {
+    const org = await Organization.findById(id, { user_id: 1 }).lean()
+    if (!org || org.user_id !== user.id) {
       return c.json({ error: 'Access denied' }, 403)
     }
   }
 
-  await dbRun('DELETE FROM organizations WHERE id = ?', [id])
+  await Organization.deleteOne({ _id: id })
   return c.json({ ok: true })
 })

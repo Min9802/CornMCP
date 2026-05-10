@@ -1,35 +1,53 @@
 import { Hono } from 'hono'
-import { dbAll, dbGet, dbRun } from '../db/client.js'
+import {
+  SetupStatus,
+  Project,
+  ApiKey,
+  ProviderAccount,
+} from '../db/mongoose/index.js'
+import { getActiveDriver } from '../db/client.js'
 
 export const setupRouter = new Hono()
 
-// ─── Get setup status ───────────────────────────────────
+// ─── Get setup status ─────────────────────────────────────
 setupRouter.get('/', async (c) => {
-  const status = await dbGet('SELECT * FROM setup_status WHERE id = 1')
-  return c.json({ completed: !!(status?.completed), completedAt: status?.completed_at })
+  // Singleton document with _id='singleton' (seeded by initSchemas).
+  const status = await SetupStatus.findById('singleton').lean()
+  return c.json({
+    completed: !!status?.completed,
+    completedAt: status?.completed_at ?? null,
+  })
 })
 
-// ─── Complete setup ─────────────────────────────────────
+// ─── Complete setup ─────────────────────────────────────────
 setupRouter.post('/complete', async (c) => {
-  await dbRun(
-    `UPDATE setup_status SET completed = 1, completed_at = datetime('now') WHERE id = 1`,
+  await SetupStatus.findOneAndUpdate(
+    { _id: 'singleton' },
+    { $set: { completed: true, completed_at: new Date() } },
+    { upsert: true, setDefaultsOnInsert: true },
   )
   return c.json({ ok: true })
 })
 
-// ─── System info ────────────────────────────────────────
+// ─── System info ────────────────────────────────────────────
 setupRouter.get('/system', async (c) => {
-  const projects = await dbGet('SELECT COUNT(*) as count FROM projects')
-  const keys = await dbGet('SELECT COUNT(*) as count FROM api_keys')
-  const providers = await dbGet('SELECT COUNT(*) as count FROM provider_accounts')
+  const [projects, apiKeys, providers] = await Promise.all([
+    Project.countDocuments(),
+    ApiKey.countDocuments(),
+    ProviderAccount.countDocuments(),
+  ])
+
+  const driver = getActiveDriver()
+  const databaseLabel = driver === 'mongo' ? 'mongodb (mongoose)' : 'sqlite (sql.js)'
 
   return c.json({
     version: '0.1.0',
     uptime: Math.floor(process.uptime()),
-    projects: projects?.count || 0,
-    apiKeys: keys?.count || 0,
-    providers: providers?.count || 0,
-    database: 'sqlite (sql.js)',
+    projects,
+    apiKeys,
+    providers,
+    database: databaseLabel,
+    driver: driver ?? 'uninitialized',
     nodeVersion: process.version,
   })
 })

@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
-import { dbAll, dbGet, dbRun } from '../db/client.js'
+import type { QueryFilter } from 'mongoose'
+import { AgentMemory, type AgentMemoryDoc } from '../db/mongoose/index.js'
 import { generateId } from '@corn/shared-utils'
 import { jwtAuthMiddleware, anyAuthMiddleware, getAuthCtx, getAgentCtx } from '../middleware/auth.js'
 
@@ -16,32 +17,24 @@ memoryRouter.get('/', jwtAuthMiddleware, async (c) => {
   const branch = c.req.query('branch')
   const agentId = c.req.query('agentId')
 
-  let query = 'SELECT * FROM agent_memories'
-  const params: unknown[] = []
-  const conditions: string[] = []
+  const filter: QueryFilter<AgentMemoryDoc> = {}
 
   if (user.role !== 'admin') {
-    const ownerConds: string[] = ['user_id = ?']
-    params.push(user.id)
-    if (projectIds.length > 0) {
-      ownerConds.push(`project_id IN (${projectIds.map(() => '?').join(',')})`)
-      params.push(...projectIds)
-    }
-    conditions.push(`(${ownerConds.join(' OR ')})`)
+    // Ownership: own memory OR memory belongs to an accessible project.
+    const owners: QueryFilter<AgentMemoryDoc>[] = [{ user_id: user.id }]
+    if (projectIds.length > 0) owners.push({ project_id: { $in: projectIds } })
+    filter.$or = owners
   }
 
-  if (projectId) { conditions.push('project_id = ?'); params.push(projectId) }
-  if (branch) { conditions.push('branch = ?'); params.push(branch) }
-  if (agentId) { conditions.push('agent_id = ?'); params.push(agentId) }
+  if (projectId) filter.project_id = projectId
+  if (branch) filter.branch = branch
+  if (agentId) filter.agent_id = agentId
 
-  if (conditions.length > 0) {
-    query += ' WHERE ' + conditions.join(' AND ')
-  }
+  const memories = await AgentMemory.find(filter)
+    .sort({ created_at: -1 })
+    .limit(limit)
+    .lean()
 
-  query += ' ORDER BY created_at DESC LIMIT ?'
-  params.push(limit)
-
-  const memories = await dbAll(query, params)
   return c.json({ memories })
 })
 
@@ -69,24 +62,23 @@ memoryRouter.post('/', anyAuthMiddleware, async (c) => {
   const content = body.content as string
   const preview = content.slice(0, 200)
 
-  await dbRun(
-    `INSERT OR REPLACE INTO agent_memories
-       (id, content, content_preview, agent_id, project_id, branch, tags, user_id, hit_count, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?,
-       COALESCE((SELECT hit_count FROM agent_memories WHERE id = ?), 0),
-       COALESCE((SELECT created_at FROM agent_memories WHERE id = ?), datetime('now')))`,
-    [
-      id,
-      content,
-      preview,
-      body.agentId || null,
-      body.projectId || null,
-      body.branch || null,
-      JSON.stringify(body.tags || []),
-      userId,
-      id,
-      id,
-    ],
+  // Mongo equivalent of `INSERT OR REPLACE`: update mutable fields, but
+  // preserve `created_at` + `hit_count` from the existing doc via $setOnInsert.
+  await AgentMemory.findOneAndUpdate(
+    { _id: id },
+    {
+      $set: {
+        content,
+        content_preview: preview,
+        agent_id: body.agentId || null,
+        project_id: body.projectId || null,
+        branch: body.branch || null,
+        tags: body.tags || [],
+        user_id: userId,
+      },
+      $setOnInsert: { _id: id, hit_count: 0 },
+    },
+    { upsert: true, setDefaultsOnInsert: true, new: true },
   )
 
   return c.json({ ok: true, id })
@@ -95,16 +87,16 @@ memoryRouter.post('/', anyAuthMiddleware, async (c) => {
 memoryRouter.get('/:id', jwtAuthMiddleware, async (c) => {
   const { id } = c.req.param()
   const { user, projectIds } = getAuthCtx(c)
-  const mem = await dbGet('SELECT * FROM agent_memories WHERE id = ?', [id])
+  const mem = await AgentMemory.findById(id).lean()
   if (!mem) return c.json({ error: 'Not found' }, 404)
 
   if (user.role !== 'admin') {
-    const owned = mem['user_id'] === user.id
-      || (mem['project_id'] && projectIds.includes(mem['project_id'] as string))
+    const owned = mem.user_id === user.id
+      || (mem.project_id && projectIds.includes(mem.project_id))
     if (!owned) return c.json({ error: 'Access denied' }, 403)
   }
 
-  await dbRun('UPDATE agent_memories SET hit_count = hit_count + 1 WHERE id = ?', [id])
+  await AgentMemory.updateOne({ _id: id }, { $inc: { hit_count: 1 } })
   return c.json({ memory: mem })
 })
 
@@ -113,14 +105,14 @@ memoryRouter.delete('/:id', jwtAuthMiddleware, async (c) => {
   const { user } = getAuthCtx(c)
 
   if (user.role !== 'admin') {
-    const mem = await dbGet('SELECT user_id FROM agent_memories WHERE id = ?', [id])
+    const mem = await AgentMemory.findById(id, { user_id: 1 }).lean()
     if (!mem) return c.json({ error: 'Not found' }, 404)
-    if (mem['user_id'] !== user.id) return c.json({ error: 'Access denied' }, 403)
+    if (mem.user_id !== user.id) return c.json({ error: 'Access denied' }, 403)
   }
 
   // NOTE: This only deletes the dashboard preview row. The semantic vector
   // entry in MCP's local mem9-vectors.db is NOT removed here — wire that in
   // a follow-up phase if hard delete is required across both stores.
-  await dbRun('DELETE FROM agent_memories WHERE id = ?', [id])
+  await AgentMemory.deleteOne({ _id: id })
   return c.json({ ok: true })
 })

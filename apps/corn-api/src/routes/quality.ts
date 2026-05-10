@@ -1,5 +1,7 @@
 import { Hono } from 'hono'
-import { dbAll, dbGet, dbRun } from '../db/client.js'
+import type { QueryFilter, PipelineStage } from 'mongoose'
+import { generateId } from '@corn/shared-utils'
+import { QualityReport, type QualityReportDoc } from '../db/mongoose/index.js'
 import { jwtAuthMiddleware, anyAuthMiddleware, getAuthCtx, getAgentCtx } from '../middleware/auth.js'
 import { touchSession } from '../services/session-lifecycle.js'
 
@@ -9,17 +11,18 @@ qualityRouter.get('/', jwtAuthMiddleware, async (c) => {
   const { user, projectIds } = getAuthCtx(c)
   const limit = Number(c.req.query('limit') || '50')
 
-  const reports = user.role === 'admin'
-    ? await dbAll('SELECT * FROM quality_reports ORDER BY created_at DESC LIMIT ?', [limit])
-    : projectIds.length > 0
-    ? await dbAll(
-        `SELECT * FROM quality_reports WHERE project_id IN (${projectIds.map(() => '?').join(',')}) OR user_id = ? ORDER BY created_at DESC LIMIT ?`,
-        [...projectIds, user.id, limit],
-      )
-    : await dbAll(
-        'SELECT * FROM quality_reports WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
-        [user.id, limit],
-      )
+  const filter: QueryFilter<QualityReportDoc> = {}
+  if (user.role !== 'admin') {
+    // Non-admin: own report OR project they have access to.
+    const owners: QueryFilter<QualityReportDoc>[] = [{ user_id: user.id }]
+    if (projectIds.length > 0) owners.push({ project_id: { $in: projectIds } })
+    filter.$or = owners
+  }
+
+  const reports = await QualityReport.find(filter)
+    .sort({ created_at: -1 })
+    .limit(limit)
+    .lean()
 
   return c.json({ reports })
 })
@@ -44,50 +47,63 @@ qualityRouter.post('/', anyAuthMiddleware, async (c) => {
     }
   }
 
-  await dbRun(
-    `INSERT INTO quality_reports (id, project_id, agent_id, session_id, gate_name, score_build, score_regression, score_standards, score_traceability, score_total, grade, passed, details, user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      body.id,
-      body.projectId || null,
-      body.agentId,
-      body.sessionId || null,
-      body.gateName,
-      body.scoreBuild,
-      body.scoreRegression,
-      body.scoreStandards,
-      body.scoreTraceability,
-      body.scoreTotal,
-      body.grade,
-      body.passed ? 1 : 0,
-      body.details ? JSON.stringify(body.details) : null,
-      userId,
-    ],
-  )
+  // Schema declares `_id: { type: String, required: true }`, which disables
+  // Mongoose auto-id. Synthesize one if the caller omits it so the create()
+  // call doesn't throw `document must have an _id before saving`.
+  const reportId = typeof body.id === 'string' && body.id ? body.id : generateId('qr')
+
+  await QualityReport.create({
+    _id: reportId,
+    project_id: body.projectId || null,
+    agent_id: body.agentId,
+    session_id: body.sessionId || null,
+    gate_name: body.gateName,
+    score_build: body.scoreBuild,
+    score_regression: body.scoreRegression,
+    score_standards: body.scoreStandards,
+    score_traceability: body.scoreTraceability,
+    score_total: body.scoreTotal,
+    grade: body.grade,
+    passed: !!body.passed,
+    details: body.details ?? null,
+    user_id: userId,
+  } as Parameters<typeof QualityReport.create>[0])
 
   // Treat a quality report as session activity so long-running sessions
   // that submit gates periodically don't get auto-closed.
   if (body.sessionId) await touchSession(body.sessionId)
 
-  return c.json({ ok: true, id: body.id })
+  return c.json({ ok: true, id: reportId })
 })
 
 qualityRouter.get('/trends', jwtAuthMiddleware, async (c) => {
   const { user, projectIds } = getAuthCtx(c)
 
-  const whereClause = user.role === 'admin'
-    ? ''
-    : projectIds.length > 0
-    ? `WHERE project_id IN (${projectIds.map(() => '?').join(',')}) OR user_id = '${user.id}'`
-    : `WHERE user_id = '${user.id}'`
+  const matchStage: PipelineStage.Match['$match'] = {}
+  if (user.role !== 'admin') {
+    const owners: Record<string, unknown>[] = [{ user_id: user.id }]
+    if (projectIds.length > 0) owners.push({ project_id: { $in: projectIds } })
+    matchStage.$or = owners
+  }
 
-  const trends = await dbAll(
-    `SELECT date(created_at) as date, AVG(score_total) as avg_score, COUNT(*) as count
-     FROM quality_reports ${whereClause}
-     GROUP BY date(created_at)
-     ORDER BY date DESC LIMIT 30`,
-    user.role !== 'admin' && projectIds.length > 0 ? projectIds : [],
-  )
+  const trends = await QualityReport.aggregate<{
+    date: string
+    avg_score: number
+    count: number
+  }>([
+    ...(Object.keys(matchStage).length ? [{ $match: matchStage }] : []),
+    {
+      $group: {
+        _id: { $dateToString: { format: '%Y-%m-%d', date: '$created_at' } },
+        avg_score: { $avg: '$score_total' },
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { _id: -1 } },
+    { $limit: 30 },
+    { $project: { _id: 0, date: '$_id', avg_score: 1, count: 1 } },
+  ])
+
   return c.json({ trends })
 })
 

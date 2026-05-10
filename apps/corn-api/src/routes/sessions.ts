@@ -1,24 +1,41 @@
+// Session handoff routes. Mongoose-backed. The fuzzy project matching
+// helpers used to lean on SQL string functions (LOWER, REPLACE) — we
+// reproduce them with case-insensitive regex + a small JS post-filter.
+//
+// Ownership scope: a project is "in scope" if its org belongs to the
+// user OR has a null user_id (legacy global org seeded as `org-default`).
+
 import { Hono } from 'hono'
-import { dbAll, dbGet, dbRun } from '../db/client.js'
 import { generateId } from '@corn/shared-utils'
-import { jwtAuthMiddleware, apiKeyAuthMiddleware, getAuthCtx, getAgentCtx } from '../middleware/auth.js'
+import { Organization, Project, SessionHandoff } from '../db/mongoose/index.js'
+import {
+  jwtAuthMiddleware,
+  apiKeyAuthMiddleware,
+  getAuthCtx,
+  getAgentCtx,
+} from '../middleware/auth.js'
 
 export const sessionsRouter = new Hono()
 
 // GET — dashboard (JWT)
 sessionsRouter.get('/', jwtAuthMiddleware, async (c) => {
   const { user, keyIds } = getAuthCtx(c)
-  const limit = Number(c.req.query('limit') || '50')
+  const limit = Math.max(1, Math.min(500, Number(c.req.query('limit') || '50')))
 
-  const sessions = user.role === 'admin'
-    ? await dbAll('SELECT * FROM session_handoffs ORDER BY created_at DESC LIMIT ?', [limit])
-    : keyIds.length > 0
-    ? await dbAll(
-        `SELECT * FROM session_handoffs WHERE from_agent IN (${keyIds.map(() => '?').join(',')}) ORDER BY created_at DESC LIMIT ?`,
-        [...keyIds, limit],
-      )
-    : []
+  let docs: Array<Record<string, unknown> & { _id: string }>
+  if (user.role === 'admin') {
+    docs = await SessionHandoff.find({}).sort({ created_at: -1 }).limit(limit).lean() as never
+  } else if (keyIds.length > 0) {
+    docs = await SessionHandoff.find({ from_agent: { $in: keyIds } })
+      .sort({ created_at: -1 })
+      .limit(limit)
+      .lean() as never
+  } else {
+    docs = []
+  }
 
+  // Preserve the legacy `id` field consumed by the dashboard.
+  const sessions = docs.map((d) => ({ ...d, id: d._id }))
   return c.json({ sessions })
 })
 
@@ -55,16 +72,34 @@ function normalizePath(p: string): string {
   return p.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 }
 
+/** Org IDs the user can see (their own + the legacy global null-owner orgs). */
+async function ownedOrgIds(userId: string): Promise<string[]> {
+  const orgs = await Organization.find(
+    { $or: [{ user_id: userId }, { user_id: null }] },
+    { _id: 1 },
+  ).lean()
+  return orgs.map((o) => o._id)
+}
+
+/** Escape regex metacharacters when interpolating user-supplied strings. */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 async function findProjectByGitUrl(userId: string, gitRepoUrl: string): Promise<string | null> {
+  const orgIds = await ownedOrgIds(userId)
+  if (orgIds.length === 0) return null
+
   for (const variant of gitUrlVariants(gitRepoUrl)) {
-    const p = await dbGet(
-      `SELECT p.id FROM projects p
-       JOIN organizations o ON p.org_id = o.id
-       WHERE LOWER(p.git_repo_url) = LOWER(?) AND (o.user_id = ? OR o.user_id IS NULL)
-       LIMIT 1`,
-      [variant, userId],
-    )
-    if (p) return p['id'] as string
+    // Case-insensitive exact match (anchored regex). Replaces SQL `LOWER(p.git_repo_url) = LOWER(?)`.
+    const found = await Project.findOne(
+      {
+        org_id: { $in: orgIds },
+        git_repo_url: { $regex: `^${escapeRegex(variant)}$`, $options: 'i' },
+      },
+      { _id: 1 },
+    ).lean()
+    if (found) return found._id
   }
   return null
 }
@@ -72,15 +107,19 @@ async function findProjectByGitUrl(userId: string, gitRepoUrl: string): Promise<
 async function findProjectByLocalPath(userId: string, localPath: string): Promise<string | null> {
   const norm = normalizePath(localPath)
   if (!norm) return null
-  const projects = await dbAll(
-    `SELECT p.id, p.git_repo_url FROM projects p
-     JOIN organizations o ON p.org_id = o.id
-     WHERE p.git_repo_url IS NOT NULL AND (o.user_id = ? OR o.user_id IS NULL)`,
-    [userId],
-  )
+
+  const orgIds = await ownedOrgIds(userId)
+  if (orgIds.length === 0) return null
+
+  // Pull every candidate then normalize+compare in JS — same shape as the
+  // legacy implementation, which couldn't push the path normalization down
+  // into SQL anyway.
+  const projects = await Project.find(
+    { org_id: { $in: orgIds }, git_repo_url: { $ne: null } },
+    { _id: 1, git_repo_url: 1 },
+  ).lean()
   for (const p of projects) {
-    const stored = p['git_repo_url'] as string | null
-    if (stored && normalizePath(stored) === norm) return p['id'] as string
+    if (p.git_repo_url && normalizePath(p.git_repo_url) === norm) return p._id
   }
   return null
 }
@@ -89,18 +128,29 @@ async function findProjectByFuzzyName(userId: string, projectName: string): Prom
   const slug = projectName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
   const fuzzy = projectName.toLowerCase().replace(/[^a-z0-9]/g, '')
   if (!fuzzy) return null
-  const p = await dbGet(
-    `SELECT p.id FROM projects p
-     JOIN organizations o ON p.org_id = o.id
-     WHERE (
-       p.slug = ?
-       OR REPLACE(REPLACE(LOWER(p.slug), '-', ''), '_', '') = ?
-       OR REPLACE(REPLACE(LOWER(p.name), '-', ''), '_', '') = ?
-     ) AND (o.user_id = ? OR o.user_id IS NULL)
-     LIMIT 1`,
-    [slug, fuzzy, fuzzy, userId],
-  )
-  return p ? (p['id'] as string) : null
+
+  const orgIds = await ownedOrgIds(userId)
+  if (orgIds.length === 0) return null
+
+  // Slug exact match first (fast, indexable).
+  const exact = await Project.findOne(
+    { org_id: { $in: orgIds }, slug },
+    { _id: 1 },
+  ).lean()
+  if (exact) return exact._id
+
+  // Fuzzy: walk projects in scope and compare normalized strings in JS.
+  // Cardinality per user stays small (single-digit orgs * 10s of projects).
+  const projects = await Project.find(
+    { org_id: { $in: orgIds } },
+    { _id: 1, slug: 1, name: 1 },
+  ).lean()
+  for (const p of projects) {
+    const slugNorm = String(p.slug ?? '').toLowerCase().replace(/[-_]/g, '')
+    const nameNorm = String(p.name ?? '').toLowerCase().replace(/[-_]/g, '')
+    if (slugNorm === fuzzy || nameNorm === fuzzy) return p._id
+  }
+  return null
 }
 
 /**
@@ -125,8 +175,6 @@ async function ensureProject(
   // via fuzzy name match (B3) or create a new row, but any project created
   // without a hint will have `git_repo_url IS NULL`, so future sessions for
   // the same repo will keep missing B1/B2 and risk spawning duplicates.
-  // Update `.agent/workflows/rules_handoff_cornhub.md` step 2 if agents keep
-  // omitting these.
   if (!hints?.gitRepoUrl && !hints?.localPath) {
     console.warn(
       `[ensureProject] No gitRepoUrl/localPath hint for project "${projectName}" (user=${userId}). ` +
@@ -148,26 +196,35 @@ async function ensureProject(
   if (found) return found
 
   // No match — create new project, persisting the hint for future resolution.
-  let org = await dbGet(
-    'SELECT id FROM organizations WHERE user_id = ? ORDER BY created_at ASC LIMIT 1',
-    [userId],
-  )
-  if (!org) {
-    const orgId = generateId('org')
-    await dbRun(
-      'INSERT INTO organizations (id, name, slug, description, user_id) VALUES (?, ?, ?, ?, ?)',
-      [orgId, 'My Workspace', 'my-workspace', 'Auto-created default organization', userId],
-    )
-    org = { id: orgId }
+  const existingOrg = await Organization.findOne({ user_id: userId }, { _id: 1 })
+    .sort({ created_at: 1 })
+    .lean()
+
+  let orgId: string
+  if (existingOrg) {
+    orgId = existingOrg._id
+  } else {
+    orgId = generateId('org')
+    await Organization.create({
+      _id: orgId,
+      name: 'My Workspace',
+      slug: 'my-workspace',
+      description: 'Auto-created default organization',
+      user_id: userId,
+    } as Parameters<typeof Organization.create>[0])
   }
 
   const slug = projectName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
   const projId = generateId('proj')
   const persistedUrl = hints?.gitRepoUrl || hints?.localPath || null
-  await dbRun(
-    `INSERT INTO projects (id, org_id, name, slug, description, git_repo_url) VALUES (?, ?, ?, ?, ?, ?)`,
-    [projId, org['id'], projectName, slug, 'Auto-created from agent session', persistedUrl],
-  )
+  await Project.create({
+    _id: projId,
+    org_id: orgId,
+    name: projectName,
+    slug,
+    description: 'Auto-created from agent session',
+    git_repo_url: persistedUrl,
+  } as Parameters<typeof Project.create>[0])
 
   return projId
 }
@@ -180,7 +237,7 @@ sessionsRouter.post('/', apiKeyAuthMiddleware, async (c) => {
   // Auto-resolve or create project. Pass gitRepoUrl/localPath hints so the
   // agent's session links to its existing project (created via UI/CLI) rather
   // than spawning a duplicate. See ensureProject() for match priority.
-  let projectId = body.projectId || null
+  let projectId: string | null = body.projectId || null
   if (!projectId && body.project && agentUserId) {
     projectId = await ensureProject(body.project, agentUserId, {
       gitRepoUrl: typeof body.gitRepoUrl === 'string' ? body.gitRepoUrl : undefined,
@@ -188,21 +245,23 @@ sessionsRouter.post('/', apiKeyAuthMiddleware, async (c) => {
     })
   }
 
-  await dbRun(
-    `INSERT INTO session_handoffs (id, from_agent, project, task_summary, context, status, project_id, last_activity_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
-    [
-      body.id,
-      agentKeyId || body.agentId || 'unknown',
-      body.project,
-      body.taskSummary,
-      JSON.stringify({ branch: body.branch }),
-      body.status || 'active',
-      projectId,
-    ],
-  )
+  // Fall back to a generated id if the agent omits one. The schema has a
+  // declared `_id` (String, required) which switches Mongoose's auto-id
+  // off, so passing undefined would throw `document must have an _id`.
+  const sessionId = typeof body.id === 'string' && body.id ? body.id : generateId('ses')
 
-  return c.json({ ok: true, id: body.id, projectId })
+  await SessionHandoff.create({
+    _id: sessionId,
+    from_agent: agentKeyId || body.agentId || 'unknown',
+    project: body.project,
+    task_summary: body.taskSummary,
+    context: { branch: body.branch },
+    status: body.status || 'active',
+    project_id: projectId,
+    last_activity_at: new Date(),
+  } as Parameters<typeof SessionHandoff.create>[0])
+
+  return c.json({ ok: true, id: sessionId, projectId })
 })
 
 // PATCH — agent update (API key)
@@ -212,18 +271,24 @@ sessionsRouter.patch('/:id', apiKeyAuthMiddleware, async (c) => {
   const { id } = c.req.param()
   const body = await c.req.json()
 
-  const context = JSON.stringify({
+  // The session_handoffs schema persists `context` as Mixed JSON. Caller
+  // shape here matches the legacy SQL JSON.stringify payload one-for-one.
+  const context = {
     summary: body.summary,
     filesChanged: body.filesChanged,
     decisions: body.decisions,
     blockers: body.blockers,
-  })
+  }
 
-  await dbRun(
-    `UPDATE session_handoffs
-     SET status = ?, context = ?, last_activity_at = datetime('now')
-     WHERE id = ?`,
-    [body.status || 'completed', context, id],
+  await SessionHandoff.updateOne(
+    { _id: id },
+    {
+      $set: {
+        status: body.status || 'completed',
+        context,
+        last_activity_at: new Date(),
+      },
+    },
   )
 
   return c.json({ ok: true })
@@ -234,11 +299,9 @@ sessionsRouter.patch('/:id', apiKeyAuthMiddleware, async (c) => {
 // full status change yet. Idempotent and safe to call frequently.
 sessionsRouter.post('/:id/heartbeat', apiKeyAuthMiddleware, async (c) => {
   const { id } = c.req.param()
-  await dbRun(
-    `UPDATE session_handoffs
-     SET last_activity_at = datetime('now')
-     WHERE id = ? AND status = 'active'`,
-    [id],
+  await SessionHandoff.updateOne(
+    { _id: id, status: 'active' },
+    { $set: { last_activity_at: new Date() } },
   )
   return c.json({ ok: true })
 })

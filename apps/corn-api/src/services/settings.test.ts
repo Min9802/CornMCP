@@ -1,26 +1,20 @@
-// Settings layer (S2) integration tests. Uses a real sql.js DB on a temp
-// file so we exercise the migration runner + schema.sql for free, the same
-// path used in production. Each test re-points DATABASE_PATH to a fresh
-// file via dynamic import + module cache reset.
+// Settings layer (S2) integration tests. Backed by an in-memory MongoDB
+// replica-set (mongodb-memory-server) — same pattern as
+// task-engines.test.ts and llm-stats.test.ts.
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import type { MongoMemoryReplSet } from 'mongodb-memory-server'
 
 // Env wiring must happen before any DB/secrets module is imported so the
-// dynamic `await import` calls below see the right DATABASE_PATH and master
-// key. We can't use `before()` for that — node:test runs `before` AFTER the
-// top-level module body has finished evaluating.
-const tmpDir = mkdtempSync(join(tmpdir(), 'corn-settings-test-'))
-process.env['DATABASE_PATH'] = join(tmpDir, 'test.db')
+// dynamic `await import` calls below see the right master key + driver.
 process.env['SYSTEM_SETTINGS_MASTER_KEY'] = 'unit-test-master-key-do-not-use-in-prod'
 delete process.env['AUTH_JWT_SECRET']
 // Short TTL so cache tests don't have to wait 60s.
 process.env['SYSTEM_SETTINGS_CACHE_TTL_MS'] = '100'
+process.env['DATABASE_DRIVER'] = 'mongo'
 
-// Import after env is wired so the modules pick up our DATABASE_PATH.
+const { setupTestMongo, teardownTestMongo } = await import('../test-utils/mongo.js')
 const { _resetKeyCacheForTests } = await import('./secrets.js')
 const {
   getSetting,
@@ -34,29 +28,19 @@ const {
   migrateFromEnv,
   DEFAULT_SETTINGS,
 } = await import('./settings.js')
-const { closeDb, flushDb } = await import('../db/client.js')
+const { SystemSetting } = await import('../db/mongoose/index.js')
 
 _resetKeyCacheForTests()
 
-// Single teardown — order is critical:
-//   1. drain the debounced async writer so no `writeFile` is mid-flight
-//   2. close the DB (sets internal db=null, stopping any future write loop)
-//   3. yield one tick so any setImmediate/setTimeout(250) backoff that was
-//      already scheduled gets a chance to no-op against the closed DB
-//   4. only THEN delete the tmpdir — otherwise the writer would ENOENT-loop
-after(async () => {
-  try { await flushDb() } catch { /* best effort */ }
-  try { closeDb() } catch { /* best effort */ }
-  await new Promise((r) => setTimeout(r, 50))
-  if (tmpDir && existsSync(tmpDir)) {
-    rmSync(tmpDir, { recursive: true, force: true })
-  }
+let replSet: MongoMemoryReplSet
+
+before(async () => {
+  replSet = await setupTestMongo()
 })
 
-// `before()` hook is intentionally absent — env was wired at module top so
-// the dynamic imports above already saw it. Keeping the import so node:test
-// recognizes this is a test file even if a future refactor adds setup back.
-void before
+after(async () => {
+  await teardownTestMongo(replSet)
+})
 
 // ── 1. Round-trip: plain value ────────────────────────────
 test('setSetting / getSetting round-trip — plain value', async () => {
@@ -118,15 +102,11 @@ test('getSetting cache holds a value within TTL', async () => {
 
   // Bypass setSetting to simulate an out-of-band write that the cache
   // shouldn't yet observe (e.g. a sibling process update).
-  const { dbRun } = await import('../db/client.js')
-  await dbRun(
-    `UPDATE system_settings SET value = ?, updated_at = datetime('now') WHERE key = ?`,
-    ['second', 'test.cached'],
-  )
+  await SystemSetting.updateOne({ _id: 'test.cached' }, { $set: { value: 'second' } })
   const v2 = await getSetting('test.cached')
   assert.equal(v2, 'first', 'value should be cached for TTL window')
 
-  // After TTL (we set 100ms in before())
+  // After TTL (we set 100ms above)
   await new Promise((r) => setTimeout(r, 150))
   const v3 = await getSetting('test.cached')
   assert.equal(v3, 'second', 'cache should expire and re-read DB')
@@ -320,8 +300,5 @@ test('migrateFromEnv seeds missing keys from env and skips present rows on re-ru
 
   // Sanity: schema shape matches what the UI expects.
   // 18 = embedding (4) + mail (8) + auth (3) + session (1) + llm bootstrap (2).
-  // Note: PROJECT_CONTEXT + plan both quoted "17" originally which is the
-  // pre-llm-bootstrap count; the llm.* keys bumped the total to 18 after
-  // the S4.10 design update.
   assert.equal(DEFAULT_SETTINGS.length, 18, 'schema pins 18 default keys')
 })

@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { dbAll, dbGet, dbRun } from '../db/client.js'
+import { Project, CodeSymbol } from '../db/mongoose/index.js'
 import { readFileSync, existsSync } from 'node:fs'
 import { join, normalize, relative } from 'node:path'
 import { execSync } from 'node:child_process'
@@ -12,19 +12,27 @@ import {
   getProjectStats,
 } from '../services/ast-engine.js'
 
+// Escape regex metacharacters so user-supplied strings are matched literally.
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+async function getDefaultProjectId(projectId?: string | null): Promise<string | null> {
+  if (projectId) return projectId
+  const proj = await Project.findOne({}, { _id: 1 }).lean()
+  return proj ? (proj._id as string) : null
+}
+
 export const intelRouter = new Hono()
 
 /**
  * Resolve a project's local root directory from the database.
  */
 async function getProjectRoot(projectId: string): Promise<string | null> {
-  const project = await dbGet(
-    `SELECT git_repo_url FROM projects WHERE id = ?`,
-    [projectId],
-  )
+  const project = await Project.findById(projectId, { git_repo_url: 1 }).lean()
   if (!project) return null
 
-  const url = project.git_repo_url as string | null
+  const url = project.git_repo_url
   if (!url) return null
 
   // If it's a local path, use it directly
@@ -71,14 +79,41 @@ intelRouter.post('/search', async (c) => {
       }
     }
 
-    // Fallback: search all projects
-    const allSymbols = await dbAll(
-      `SELECT s.name, s.kind, s.file_path, s.start_line, s.exported, p.name as project_name
-       FROM code_symbols s JOIN projects p ON s.project_id = p.id
-       WHERE s.name LIKE ? OR s.file_path LIKE ? OR s.signature LIKE ?
-       ORDER BY s.exported DESC, s.name LIMIT ?`,
-      [`%${query}%`, `%${query}%`, `%${query}%`, limit ?? 10],
-    )
+    // Fallback: search all projects via aggregate $lookup (replaces SQL JOIN).
+    const escaped = escapeRegex(query)
+    const re = new RegExp(escaped, 'i')
+    const allSymbols = await CodeSymbol.aggregate<{
+      name: string
+      kind: string
+      file_path: string
+      start_line: number
+      exported: boolean
+      project_name: string
+    }>([
+      { $match: { $or: [{ name: re }, { file_path: re }, { signature: re }] } },
+      {
+        $lookup: {
+          from: 'projects',
+          localField: 'project_id',
+          foreignField: '_id',
+          as: 'project',
+        },
+      },
+      { $unwind: { path: '$project', preserveNullAndEmptyArrays: true } },
+      { $sort: { exported: -1, name: 1 } },
+      { $limit: limit ?? 10 },
+      {
+        $project: {
+          _id: 0,
+          name: 1,
+          kind: 1,
+          file_path: 1,
+          start_line: 1,
+          exported: 1,
+          project_name: '$project.name',
+        },
+      },
+    ])
 
     if (allSymbols.length > 0) {
       const lines = [`🔍 **Search: "${query}"** — ${allSymbols.length} results across all projects\n`]
@@ -108,8 +143,8 @@ intelRouter.post('/context', async (c) => {
     const { name, projectId, file } = body
     if (!name) return c.json({ error: 'Symbol name is required' }, 400)
 
-    // If no projectId, search all projects
-    const effectiveProjectId = projectId || (await dbGet(`SELECT id FROM projects LIMIT 1`))?.id
+    // If no projectId, search the first available project.
+    const effectiveProjectId = await getDefaultProjectId(projectId)
 
     if (!effectiveProjectId) {
       return c.json({
@@ -192,7 +227,7 @@ intelRouter.post('/impact', async (c) => {
     const { target, direction, projectId } = body
     if (!target) return c.json({ error: 'Target is required' }, 400)
 
-    const effectiveProjectId = projectId || (await dbGet(`SELECT id FROM projects LIMIT 1`))?.id
+    const effectiveProjectId = await getDefaultProjectId(projectId)
     if (!effectiveProjectId) {
       return c.json({
         success: true,
@@ -319,18 +354,17 @@ intelRouter.post('/detect-changes', async (c) => {
       }
     }
 
-    // Cross-reference with indexed symbols if project is indexed
+    // Cross-reference with indexed symbols if project is indexed.
     let affectedSymbols: Record<string, unknown>[] = []
     if (projectId) {
       const filePaths = changedFiles.map(f => f.file)
       if (filePaths.length > 0) {
-        const conditions = filePaths.map(() => 'file_path LIKE ?').join(' OR ')
-        const params = filePaths.map(f => `%${f}%`)
-        affectedSymbols = await dbAll(
-          `SELECT name, kind, file_path, exported FROM code_symbols
-           WHERE project_id = ? AND (${conditions})`,
-          [projectId, ...params],
-        )
+        // Build a single $regex disjunction over file_path.
+        const pathPatterns = filePaths.map(f => new RegExp(escapeRegex(f), 'i'))
+        affectedSymbols = await CodeSymbol.find(
+          { project_id: projectId, file_path: { $in: pathPatterns } },
+          { _id: 0, name: 1, kind: 1, file_path: 1, exported: 1 },
+        ).lean()
       }
     }
 
@@ -363,7 +397,7 @@ intelRouter.post('/cypher', async (c) => {
     const { query: cypherQuery, projectId } = body
     if (!cypherQuery) return c.json({ error: 'Cypher query is required' }, 400)
 
-    const effectiveProjectId = projectId || (await dbGet(`SELECT id FROM projects LIMIT 1`))?.id
+    const effectiveProjectId = await getDefaultProjectId(projectId)
     if (!effectiveProjectId) {
       return c.json({ success: true, data: { query: cypherQuery, results: [], message: 'No projects found.' } })
     }
@@ -378,13 +412,47 @@ intelRouter.post('/cypher', async (c) => {
 // ── List Repos ──────────────────────────────────────────
 intelRouter.get('/repos', async (c) => {
   try {
-    const projects = await dbAll(
-      `SELECT p.id as projectId, p.slug, p.name, p.git_repo_url, p.indexed_symbols as symbols,
-              p.indexed_at, p.description,
-              (SELECT COUNT(*) FROM code_symbols WHERE project_id = p.id) as live_symbols,
-              (SELECT COUNT(*) FROM code_edges WHERE project_id = p.id) as edges
-       FROM projects p ORDER BY p.name`,
-    )
+    // Replace SQL subquery COUNT(*) JOIN with two $lookup pipelines that
+    // pre-aggregate per-project counts before returning to the dashboard.
+    const projects = await Project.aggregate([
+      { $sort: { name: 1 } },
+      {
+        $lookup: {
+          from: 'code_symbols',
+          let: { pid: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $eq: ['$project_id', '$$pid'] } } },
+            { $count: 'count' },
+          ],
+          as: 'symbol_stats',
+        },
+      },
+      {
+        $lookup: {
+          from: 'code_edges',
+          let: { pid: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $eq: ['$project_id', '$$pid'] } } },
+            { $count: 'count' },
+          ],
+          as: 'edge_stats',
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          projectId: '$_id',
+          slug: 1,
+          name: 1,
+          git_repo_url: 1,
+          symbols: '$indexed_symbols',
+          indexed_at: 1,
+          description: 1,
+          live_symbols: { $ifNull: [{ $arrayElemAt: ['$symbol_stats.count', 0] }, 0] },
+          edges: { $ifNull: [{ $arrayElemAt: ['$edge_stats.count', 0] }, 0] },
+        },
+      },
+    ])
     return c.json({ success: true, data: projects })
   } catch (error) {
     return c.json({ success: false, error: String(error) }, 500)

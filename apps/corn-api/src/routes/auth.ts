@@ -1,27 +1,30 @@
 import { Hono } from 'hono'
 import bcrypt from 'bcryptjs'
 import crypto from 'node:crypto'
-import { dbGet, dbRun, dbAll } from '../db/client.js'
 import { generateId, hashApiKey } from '@corn/shared-utils'
+import { ApiKey, EmailOtp, User } from '../db/mongoose/index.js'
 import { signJwt, verifyJwt, getCookie, setCookie, deleteCookie, type AuthUser } from '../middleware/auth.js'
 import { sendOtpEmail } from '../services/mailer.js'
 
 export const authRouter = new Hono()
 
-// ── Helper: generate & store OTP ─────────────────────────
+// ── Helper: generate & store OTP ─────────────────────
 async function generateAndSendOtp(userId: string, email: string): Promise<boolean> {
   const otp = crypto.randomInt(100000, 999999).toString()
   const otpHash = await bcrypt.hash(otp, 10)
   const id = generateId('otp')
-  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+  // expires_at is a Date so the schema TTL index (expireAfterSeconds: 0)
+  // can clean up expired rows automatically.
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000)
 
-  // Delete old OTPs for this user
-  await dbRun('DELETE FROM email_otps WHERE user_id = ?', [userId])
-
-  await dbRun(
-    'INSERT INTO email_otps (id, user_id, otp_hash, expires_at) VALUES (?, ?, ?, ?)',
-    [id, userId, otpHash, expiresAt],
-  )
+  // Replace any in-flight OTP for this user; only one valid code at a time.
+  await EmailOtp.deleteMany({ user_id: userId })
+  await EmailOtp.create({
+    _id: id,
+    user_id: userId,
+    otp_hash: otpHash,
+    expires_at: expiresAt,
+  })
 
   return sendOtpEmail(email, otp)
 }
@@ -42,22 +45,29 @@ authRouter.post('/register', async (c) => {
     return c.json({ error: 'Invalid email format' }, 400)
   }
 
-  const userCount = await dbGet('SELECT COUNT(*) as count FROM users')
-  const isFirst = Number(userCount?.['count'] ?? 0) === 0
-
-  const existing = await dbGet('SELECT id FROM users WHERE email = ?', [email.toLowerCase()])
+  const lowercased = (email as string).toLowerCase()
+  const [userCount, existing] = await Promise.all([
+    User.countDocuments(),
+    User.findOne({ email: lowercased }, { _id: 1 }).lean(),
+  ])
+  const isFirst = userCount === 0
   if (existing) return c.json({ error: 'Email already registered' }, 409)
 
   const id = generateId('usr')
   const passwordHash = await bcrypt.hash(password, 12)
-  const role = isFirst ? 'admin' : 'user'
-  const emailVerified = isFirst ? 1 : 0
+  const role: 'admin' | 'user' = isFirst ? 'admin' : 'user'
 
-  await dbRun(
-    `INSERT INTO users (id, email, password_hash, name, role, is_active, email_verified)
-     VALUES (?, ?, ?, ?, ?, 1, ?)`,
-    [id, email.toLowerCase(), passwordHash, name, role, emailVerified],
-  )
+  // Cast payload — Mongoose 9 strict types don't accept null/boolean
+  // defaults at the call site even though the schema validates them
+  // at runtime. See https://github.com/Automattic/mongoose/issues/14013.
+  await User.create({
+    _id: id,
+    email: lowercased,
+    password_hash: passwordHash,
+    name,
+    role,
+    email_verified: isFirst,
+  } as Parameters<typeof User.create>[0])
 
   // First user (admin) → auto verified, no OTP
   if (isFirst) {
@@ -65,7 +75,7 @@ authRouter.post('/register', async (c) => {
   }
 
   // Send OTP email
-  await generateAndSendOtp(id, email.toLowerCase())
+  await generateAndSendOtp(id, lowercased)
 
   return c.json({ ok: true, id, role, needsVerification: true }, 201)
 })
@@ -77,26 +87,30 @@ authRouter.post('/login', async (c) => {
 
   if (!email || !password) return c.json({ error: 'email and password are required' }, 400)
 
-  const row = await dbGet(
-    'SELECT id, email, name, role, password_hash, email_verified FROM users WHERE email = ? AND is_active = 1',
-    [email.toLowerCase()],
-  )
+  const lowercased = (email as string).toLowerCase()
+  const row = await User.findOne(
+    { email: lowercased, is_active: true },
+    { _id: 1, email: 1, name: 1, role: 1, password_hash: 1, email_verified: 1 },
+  ).lean()
   if (!row) return c.json({ error: 'Invalid email or password' }, 401)
 
-  const valid = await bcrypt.compare(password, row['password_hash'] as string)
+  // password_hash can be null for OAuth-only accounts — reject password
+  // logins for those.
+  if (!row.password_hash) return c.json({ error: 'Invalid email or password' }, 401)
+  const valid = await bcrypt.compare(password, row.password_hash)
   if (!valid) return c.json({ error: 'Invalid email or password' }, 401)
 
   // Check email verification
-  if (!row['email_verified']) {
-    await generateAndSendOtp(row['id'] as string, email.toLowerCase())
-    return c.json({ ok: false, needsVerification: true, email: email.toLowerCase() }, 403)
+  if (!row.email_verified) {
+    await generateAndSendOtp(row._id, lowercased)
+    return c.json({ ok: false, needsVerification: true, email: lowercased }, 403)
   }
 
   const user: AuthUser = {
-    id: row['id'] as string,
-    email: row['email'] as string,
-    name: row['name'] as string,
-    role: row['role'] as 'admin' | 'user',
+    id: row._id,
+    email: row.email,
+    name: row.name,
+    role: row.role,
   }
 
   const token = await signJwt(user)
@@ -112,74 +126,79 @@ authRouter.post('/login', async (c) => {
   return c.json({ ok: true, user })
 })
 
-// ─── Verify OTP ──────────────────────────────────────────
+// ─── Verify OTP ─────────────────────────────────────────
 authRouter.post('/verify-otp', async (c) => {
   const body = await c.req.json()
   const { email, otp } = body
 
   if (!email || !otp) return c.json({ error: 'email and otp are required' }, 400)
 
-  const user = await dbGet('SELECT id FROM users WHERE email = ? AND is_active = 1', [email.toLowerCase()])
+  const lowercased = (email as string).toLowerCase()
+  const user = await User.findOne({ email: lowercased, is_active: true }, { _id: 1 }).lean()
   if (!user) return c.json({ error: 'User not found' }, 404)
 
-  const userId = user['id'] as string
-  const otpRow = await dbGet(
-    'SELECT id, otp_hash, expires_at FROM email_otps WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
-    [userId],
+  const userId = user._id
+  // Latest OTP for this user (we only ever keep one valid row, but tolerate
+  // legacy rows that pre-date the dedup logic by sorting).
+  const otpRow = await EmailOtp.findOne(
+    { user_id: userId },
+    { _id: 1, otp_hash: 1, expires_at: 1 },
   )
+    .sort({ created_at: -1 })
+    .lean()
 
   if (!otpRow) return c.json({ error: 'No verification code found. Please request a new one.' }, 400)
 
   // Check expiry
-  const expiresAt = new Date(otpRow['expires_at'] as string).getTime()
-  if (Date.now() > expiresAt) {
-    await dbRun('DELETE FROM email_otps WHERE user_id = ?', [userId])
+  if (Date.now() > otpRow.expires_at.getTime()) {
+    await EmailOtp.deleteMany({ user_id: userId })
     return c.json({ error: 'Verification code expired. Please request a new one.' }, 400)
   }
 
   // Check OTP
-  const match = await bcrypt.compare(otp, otpRow['otp_hash'] as string)
+  const match = await bcrypt.compare(otp, otpRow.otp_hash)
   if (!match) return c.json({ error: 'Invalid verification code' }, 400)
 
-  // Mark verified & cleanup
-  await dbRun('UPDATE users SET email_verified = 1, updated_at = datetime(\'now\') WHERE id = ?', [userId])
-  await dbRun('DELETE FROM email_otps WHERE user_id = ?', [userId])
+  // Mark verified & cleanup. updated_at is auto-managed by `timestamps`.
+  await Promise.all([
+    User.updateOne({ _id: userId }, { $set: { email_verified: true } }),
+    EmailOtp.deleteMany({ user_id: userId }),
+  ])
 
   return c.json({ ok: true })
 })
 
-// ─── Resend OTP ──────────────────────────────────────────
+// ─── Resend OTP ─────────────────────────────────────────
 authRouter.post('/resend-otp', async (c) => {
   const body = await c.req.json()
   const { email } = body
 
   if (!email) return c.json({ error: 'email is required' }, 400)
 
-  const user = await dbGet(
-    'SELECT id, email_verified FROM users WHERE email = ? AND is_active = 1',
-    [email.toLowerCase()],
-  )
+  const lowercased = (email as string).toLowerCase()
+  const user = await User.findOne(
+    { email: lowercased, is_active: true },
+    { _id: 1, email_verified: 1 },
+  ).lean()
   if (!user) return c.json({ error: 'User not found' }, 404)
-  if (user['email_verified']) return c.json({ error: 'Email already verified' }, 400)
+  if (user.email_verified) return c.json({ error: 'Email already verified' }, 400)
 
-  const userId = user['id'] as string
+  const userId = user._id
 
-  // Check cooldown — 2 minutes
-  const lastOtp = await dbGet(
-    'SELECT created_at FROM email_otps WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
-    [userId],
-  )
-  if (lastOtp) {
-    const createdAt = new Date(lastOtp['created_at'] as string).getTime()
+  // Check cooldown — 2 minutes between OTP requests.
+  const lastOtp = await EmailOtp.findOne({ user_id: userId }, { created_at: 1 })
+    .sort({ created_at: -1 })
+    .lean()
+  if (lastOtp?.created_at) {
     const cooldownMs = 2 * 60 * 1000
-    const elapsed = Date.now() - createdAt
+    const elapsed = Date.now() - lastOtp.created_at.getTime()
     if (elapsed < cooldownMs) {
       const remaining = Math.ceil((cooldownMs - elapsed) / 1000)
       return c.json({ error: `Please wait ${remaining} seconds before requesting a new code`, cooldownSeconds: remaining }, 429)
     }
   }
 
-  await generateAndSendOtp(userId, email.toLowerCase())
+  await generateAndSendOtp(userId, lowercased)
 
   return c.json({ ok: true })
 })
@@ -199,30 +218,37 @@ authRouter.get('/me', async (c) => {
   return c.json({ user })
 })
 
-// ─── Validate API Key (for MCP server) ───────────────────
-// MCP server calls this to validate user API keys against the DB.
+// ─── Validate API Key (for MCP server) ───────────────
+// MCP server calls this to validate user API keys against the DB. The
+// SQL version did a LEFT JOIN on users; we issue two queries here
+// because Mongo doesn't have FK joins. Same result shape.
 authRouter.post('/validate-key', async (c) => {
   const body = await c.req.json()
   const rawKey = body.key
   if (!rawKey) return c.json({ valid: false, error: 'No key provided' }, 400)
 
   const keyHash = hashApiKey(rawKey)
-  const keyRow = await dbGet(
-    'SELECT k.id, k.name, k.user_id, u.email, u.name as user_name, u.role FROM api_keys k LEFT JOIN users u ON k.user_id = u.id WHERE k.key_hash = ?',
-    [keyHash],
-  )
+  const keyRow = await ApiKey.findOne(
+    { key_hash: keyHash },
+    { _id: 1, name: 1, user_id: 1 },
+  ).lean()
   if (!keyRow) return c.json({ valid: false, error: 'Invalid API key' })
 
-  // Update last_used_at
-  await dbRun(`UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?`, [keyRow['id'] as string])
+  // user_id is nullable on legacy keys created before tenancy.
+  const userRow = keyRow.user_id
+    ? await User.findById(keyRow.user_id, { email: 1, name: 1, role: 1 }).lean()
+    : null
+
+  // Update last_used_at — fire and forget to keep MCP latency low.
+  void ApiKey.updateOne({ _id: keyRow._id }, { $set: { last_used_at: new Date() } })
 
   return c.json({
     valid: true,
-    keyId: keyRow['id'],
-    keyName: keyRow['name'],
-    userId: keyRow['user_id'],
-    userName: keyRow['user_name'],
-    userRole: keyRow['role'],
+    keyId: keyRow._id,
+    keyName: keyRow.name,
+    userId: keyRow.user_id,
+    userName: userRow?.name ?? null,
+    userRole: userRow?.role ?? null,
   })
 })
 
@@ -313,44 +339,55 @@ authRouter.get('/google/callback', async (c) => {
       return c.redirect(`${webOrigin}/login?error=google_email_unverified`)
     }
 
-    const email = googleUser.email.toLowerCase()
+    const emailLower = googleUser.email.toLowerCase()
 
-    // Find existing user by google_id or email
-    let user = await dbGet(
-      'SELECT id, email, name, role, is_active, google_id FROM users WHERE google_id = ? OR email = ?',
-      [googleUser.id, email],
-    )
+    // Find existing user by google_id or email. SQL version used `OR`
+    // in a single query; Mongo equivalent is `$or`.
+    let user = await User.findOne(
+      { $or: [{ google_id: googleUser.id }, { email: emailLower }] },
+      { _id: 1, email: 1, name: 1, role: 1, is_active: 1, google_id: 1 },
+    ).lean()
     let isNewUser = false
 
     if (user) {
-      // Existing user — update google_id/avatar if not set
-      if (!user['is_active']) {
+      if (!user.is_active) {
         return c.redirect(`${webOrigin}/login?error=account_disabled`)
       }
-      await dbRun(
-        `UPDATE users SET google_id = ?, avatar_url = ?, email_verified = 1, updated_at = datetime('now') WHERE id = ?`,
-        [googleUser.id, googleUser.picture || null, user['id']],
+      await User.updateOne(
+        { _id: user._id },
+        {
+          $set: {
+            google_id: googleUser.id,
+            avatar_url: googleUser.picture || null,
+            email_verified: true,
+          },
+        },
       )
     } else {
-      // New user via Google — always 'user' role
+      // New user via Google — always 'user' role unless they're the
+      // very first signup (then they get the bootstrap admin slot).
       isNewUser = true
-      const userCount = await dbGet('SELECT COUNT(*) as count FROM users')
-      // Only auto-admin if truly the first user ever
-      const isFirst = Number(userCount?.['count'] ?? 0) === 0
+      const userCount = await User.countDocuments()
+      const isFirst = userCount === 0
       const id = generateId('usr')
-      await dbRun(
-        `INSERT INTO users (id, email, password_hash, name, role, is_active, email_verified, google_id, avatar_url)
-         VALUES (?, ?, NULL, ?, ?, 1, 1, ?, ?)`,
-        [id, email, googleUser.name, isFirst ? 'admin' : 'user', googleUser.id, googleUser.picture || null],
-      )
-      user = await dbGet('SELECT id, email, name, role FROM users WHERE id = ?', [id])
+      await User.create({
+        _id: id,
+        email: emailLower,
+        password_hash: null,
+        name: googleUser.name,
+        role: isFirst ? 'admin' : 'user',
+        email_verified: true,
+        google_id: googleUser.id,
+        avatar_url: googleUser.picture || null,
+      } as Parameters<typeof User.create>[0])
+      user = await User.findById(id, { _id: 1, email: 1, name: 1, role: 1 }).lean()
     }
 
     const authUser: AuthUser = {
-      id: user!['id'] as string,
-      email: user!['email'] as string,
-      name: user!['name'] as string,
-      role: user!['role'] as 'admin' | 'user',
+      id: user!._id,
+      email: user!.email,
+      name: user!.name,
+      role: user!.role,
     }
 
     const token = await signJwt(authUser)
@@ -386,10 +423,7 @@ authRouter.post('/set-password', async (c) => {
   }
 
   const passwordHash = await bcrypt.hash(password, 12)
-  await dbRun(
-    `UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?`,
-    [passwordHash, me.id],
-  )
+  await User.updateOne({ _id: me.id }, { $set: { password_hash: passwordHash } })
 
   return c.json({ ok: true })
 })

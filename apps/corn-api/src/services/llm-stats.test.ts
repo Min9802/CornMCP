@@ -1,30 +1,29 @@
-// LLM stats aggregation (S6.4) integration tests. Same pattern as
-// task-engines.test.ts: tempdir DB + env wired top-level before any
-// import that loads a DB module, single after() teardown.
+// LLM stats aggregation (S6.4) integration tests. Backed by an
+// in-memory MongoDB replica-set (mongodb-memory-server) — same pattern
+// as task-engines.test.ts.
 
-import { test, after } from 'node:test'
+import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import type { MongoMemoryReplSet } from 'mongodb-memory-server'
 
-const tmpDir = mkdtempSync(join(tmpdir(), 'corn-llm-stats-test-'))
-process.env['DATABASE_PATH'] = join(tmpDir, 'test.db')
 process.env['SYSTEM_SETTINGS_MASTER_KEY'] = 'unit-test-master-key-do-not-use-in-prod'
 delete process.env['AUTH_JWT_SECRET']
 process.env['SYSTEM_SETTINGS_CACHE_TTL_MS'] = '50'
+process.env['DATABASE_DRIVER'] = 'mongo'
 
+const { setupTestMongo, teardownTestMongo } = await import('../test-utils/mongo.js')
 const { getLlmStats, getCostCapStatus } = await import('./llm-stats.js')
 const { setSetting, _clearSettingsCacheForTests } = await import('./settings.js')
-const { closeDb, flushDb, dbRun } = await import('../db/client.js')
+const { LlmGatewayLog } = await import('../db/mongoose/index.js')
+
+let replSet: MongoMemoryReplSet
+
+before(async () => {
+  replSet = await setupTestMongo()
+})
 
 after(async () => {
-  try { await flushDb() } catch { /* best effort */ }
-  try { closeDb() } catch { /* best effort */ }
-  await new Promise((r) => setTimeout(r, 50))
-  if (tmpDir && existsSync(tmpDir)) {
-    rmSync(tmpDir, { recursive: true, force: true })
-  }
+  await teardownTestMongo(replSet)
 })
 
 // Insert a synthetic gateway log row. Times are passed explicitly so
@@ -35,37 +34,32 @@ async function logRow(opts: {
   model?: string | null
   cost?: number
   latency?: number
-  cached?: 0 | 1
+  cached?: boolean
   error?: string | null
   inputTokens?: number
   outputTokens?: number
   ageHours?: number
 }): Promise<void> {
   const ageH = opts.ageHours ?? 0
-  await dbRun(
-    `INSERT INTO llm_gateway_logs
-       (task_name, provider_id, provider, model, input_tokens, output_tokens,
-        cost_usd, latency_ms, cached, error, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', ?))`,
-    [
-      opts.task ?? null,
-      opts.provider ? `prov-${opts.provider}` : null,
-      opts.provider ?? null,
-      opts.model ?? null,
-      opts.inputTokens ?? 100,
-      opts.outputTokens ?? 50,
-      opts.cost ?? 0.001,
-      opts.latency ?? 200,
-      opts.cached ?? 0,
-      opts.error ?? null,
-      `-${ageH} hour`,
-    ],
-  )
+  const created = new Date(Date.now() - ageH * 60 * 60 * 1000)
+  await LlmGatewayLog.create({
+    task_name: opts.task ?? null,
+    provider_id: opts.provider ? `prov-${opts.provider}` : null,
+    provider: opts.provider ?? null,
+    model: opts.model ?? null,
+    input_tokens: opts.inputTokens ?? 100,
+    output_tokens: opts.outputTokens ?? 50,
+    cost_usd: opts.cost ?? 0.001,
+    latency_ms: opts.latency ?? 200,
+    cached: opts.cached ?? false,
+    error: opts.error ?? null,
+    created_at: created,
+  } as unknown as Parameters<typeof LlmGatewayLog.create>[0])
 }
 
 // ── 1. Empty DB → zero stats, no breakdowns ────────────
 test('getLlmStats returns zeroed totals when there are no logs', async () => {
-  await dbRun('DELETE FROM llm_gateway_logs', [])
+  await LlmGatewayLog.deleteMany({})
 
   const stats = await getLlmStats(7)
   assert.equal(stats.windowDays, 7)
@@ -80,13 +74,13 @@ test('getLlmStats returns zeroed totals when there are no logs', async () => {
 
 // ── 2. Aggregate stats happy path ──────────────────────
 test('getLlmStats aggregates totals + per-task + per-provider correctly', async () => {
-  await dbRun('DELETE FROM llm_gateway_logs', [])
+  await LlmGatewayLog.deleteMany({})
 
   // Day 0: 4 successful (2 cached, 2 live), 1 errored, mixed providers
-  await logRow({ task: 'plan_quality',     provider: 'openai',    model: 'gpt-4o-mini', cost: 0.01,  cached: 0, latency: 300 })
-  await logRow({ task: 'plan_quality',     provider: 'openai',    model: 'gpt-4o-mini', cost: 0,     cached: 1, latency: 0   })
-  await logRow({ task: 'session_summary',  provider: 'anthropic', model: 'claude-3-5-haiku-20241022', cost: 0.02, cached: 0, latency: 500 })
-  await logRow({ task: 'session_summary',  provider: 'anthropic', model: 'claude-3-5-haiku-20241022', cost: 0,    cached: 1, latency: 0   })
+  await logRow({ task: 'plan_quality',     provider: 'openai',    model: 'gpt-4o-mini', cost: 0.01,  cached: false, latency: 300 })
+  await logRow({ task: 'plan_quality',     provider: 'openai',    model: 'gpt-4o-mini', cost: 0,     cached: true,  latency: 0   })
+  await logRow({ task: 'session_summary',  provider: 'anthropic', model: 'claude-3-5-haiku-20241022', cost: 0.02, cached: false, latency: 500 })
+  await logRow({ task: 'session_summary',  provider: 'anthropic', model: 'claude-3-5-haiku-20241022', cost: 0,    cached: true,  latency: 0   })
   await logRow({ task: 'memory_dedup',     provider: 'gemini',    model: 'gemini-1.5-flash', error: 'rate limited', cost: 0, latency: 0 })
 
   const stats = await getLlmStats(1)
@@ -117,7 +111,7 @@ test('getLlmStats aggregates totals + per-task + per-provider correctly', async 
 
 // ── 3. cost-cap-status reflects DB spent vs setting ────
 test('getCostCapStatus returns spent + cap + warning thresholds', async () => {
-  await dbRun('DELETE FROM llm_gateway_logs', [])
+  await LlmGatewayLog.deleteMany({})
   // 0.85 USD spent today
   await logRow({ task: 't1', provider: 'openai', model: 'm', cost: 0.5 })
   await logRow({ task: 't2', provider: 'openai', model: 'm', cost: 0.35 })

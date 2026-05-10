@@ -12,7 +12,8 @@
 // duplicate code paths. Keep them separated by audience: hot-path
 // enforcement vs cold-path analytics.
 
-import { dbAll, dbGet } from '../db/client.js'
+import type { PipelineStage } from 'mongoose'
+import { LlmGatewayLog } from '../db/mongoose/index.js'
 import { getSetting } from './settings.js'
 
 // Cap windowed reads at 90 days even if the caller passes more — keeps
@@ -84,96 +85,141 @@ function rate(num: number, denom: number): number {
  * GROUP BYs run in parallel via Promise.all because the indexes are
  * disjoint — `(task_name, created)` and `(provider_id, created)`.
  */
+// Pipeline shapes for the GROUP BY breakdowns. Mongoose returns these
+// raw from the aggregation framework; we flatten + sort below.
+interface BreakdownAggRow {
+  _id: string | null
+  calls: number
+  cost: number
+  lat: number | null
+  cached_calls: number
+}
+
+interface TotalsAggRow {
+  total_calls: number
+  success_calls: number
+  cached_calls: number
+  errored_calls: number
+  total_cost: number
+  in_tokens: number
+  out_tokens: number
+  avg_latency: number | null
+}
+
+interface ErrorAggRow {
+  task_name: string | null
+  provider: string | null
+  model: string | null
+  error: string | null
+  created_at: Date | null
+}
+
 export async function getLlmStats(days: number = 1): Promise<LlmStats> {
   const window = clampDays(days)
-  const since = `datetime('now', '-${window} day')`
+  const since = new Date(Date.now() - window * 24 * 60 * 60 * 1000)
+  const matchSince = { created_at: { $gte: since } }
 
-  const [totalsRow, byTaskRows, byProviderRows, byModelRows, errorRows] = await Promise.all([
-    dbGet(
-      `SELECT
-         COUNT(*)                                              AS total_calls,
-         SUM(CASE WHEN error IS NULL THEN 1 ELSE 0 END)        AS success_calls,
-         SUM(CASE WHEN cached = 1 THEN 1 ELSE 0 END)           AS cached_calls,
-         SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END)    AS errored_calls,
-         COALESCE(SUM(CASE WHEN error IS NULL THEN cost_usd END), 0) AS total_cost,
-         COALESCE(SUM(input_tokens), 0)                        AS in_tokens,
-         COALESCE(SUM(output_tokens), 0)                       AS out_tokens,
-         COALESCE(AVG(CASE WHEN cached = 0 AND error IS NULL THEN latency_ms END), 0) AS avg_latency
-       FROM llm_gateway_logs
-       WHERE created_at >= ${since}`,
+  // Conditional accumulators replace the SQL CASE WHEN expressions.
+  const successCond = { $cond: [{ $eq: ['$error', null] }, 1, 0] }
+  const cachedCond = { $cond: [{ $eq: ['$cached', true] }, 1, 0] }
+  const erroredCond = { $cond: [{ $eq: ['$error', null] }, 0, 1] }
+  const successCostCond = { $cond: [{ $eq: ['$error', null] }, '$cost_usd', 0] }
+  // Latency average excludes cached + errored rows so the number
+  // reflects real provider call time.
+  const realLatencyCond = {
+    $cond: [
+      { $and: [{ $eq: ['$cached', false] }, { $eq: ['$error', null] }] },
+      '$latency_ms',
+      null,
+    ],
+  }
+
+  function buildBreakdownPipeline(field: string, fallbackKey: string, limit?: number): PipelineStage[] {
+    const pipeline: PipelineStage[] = [
+      { $match: matchSince },
+      {
+        $group: {
+          _id: { $ifNull: [`$${field}`, fallbackKey] },
+          calls: { $sum: 1 },
+          cost: { $sum: '$cost_usd' },
+          lat: { $avg: '$latency_ms' },
+          cached_calls: { $sum: cachedCond },
+        },
+      },
+      { $sort: { cost: -1, calls: -1 } },
+    ]
+    if (limit) pipeline.push({ $limit: limit })
+    return pipeline
+  }
+
+  const [totalsRows, byTaskRows, byProviderRows, byModelRows, errorRows] = await Promise.all([
+    LlmGatewayLog.aggregate<TotalsAggRow>([
+      { $match: matchSince },
+      {
+        $group: {
+          _id: null,
+          total_calls: { $sum: 1 },
+          success_calls: { $sum: successCond },
+          cached_calls: { $sum: cachedCond },
+          errored_calls: { $sum: erroredCond },
+          total_cost: { $sum: successCostCond },
+          in_tokens: { $sum: '$input_tokens' },
+          out_tokens: { $sum: '$output_tokens' },
+          avg_latency: { $avg: realLatencyCond },
+        },
+      },
+    ]),
+    LlmGatewayLog.aggregate<BreakdownAggRow>(
+      buildBreakdownPipeline('task_name', '(none)', 25),
     ),
-    dbAll(
-      `SELECT
-         COALESCE(task_name, '(none)') AS k,
-         COUNT(*)                       AS calls,
-         COALESCE(SUM(cost_usd), 0)     AS cost,
-         COALESCE(AVG(latency_ms), 0)   AS lat,
-         SUM(CASE WHEN cached = 1 THEN 1 ELSE 0 END) AS cached_calls
-       FROM llm_gateway_logs
-       WHERE created_at >= ${since}
-       GROUP BY k
-       ORDER BY cost DESC, calls DESC
-       LIMIT 25`,
+    LlmGatewayLog.aggregate<BreakdownAggRow>(
+      buildBreakdownPipeline('provider', '(unknown)'),
     ),
-    dbAll(
-      `SELECT
-         COALESCE(provider, '(unknown)') AS k,
-         COUNT(*)                         AS calls,
-         COALESCE(SUM(cost_usd), 0)       AS cost,
-         COALESCE(AVG(latency_ms), 0)     AS lat,
-         SUM(CASE WHEN cached = 1 THEN 1 ELSE 0 END) AS cached_calls
-       FROM llm_gateway_logs
-       WHERE created_at >= ${since}
-       GROUP BY k
-       ORDER BY cost DESC, calls DESC`,
+    LlmGatewayLog.aggregate<BreakdownAggRow>(
+      buildBreakdownPipeline('model', '(unknown)', 25),
     ),
-    dbAll(
-      `SELECT
-         COALESCE(model, '(unknown)') AS k,
-         COUNT(*)                      AS calls,
-         COALESCE(SUM(cost_usd), 0)    AS cost,
-         COALESCE(AVG(latency_ms), 0)  AS lat,
-         SUM(CASE WHEN cached = 1 THEN 1 ELSE 0 END) AS cached_calls
-       FROM llm_gateway_logs
-       WHERE created_at >= ${since}
-       GROUP BY k
-       ORDER BY cost DESC, calls DESC
-       LIMIT 25`,
-    ),
-    dbAll(
-      `SELECT task_name, provider, model, error, created_at
-       FROM llm_gateway_logs
-       WHERE error IS NOT NULL
-         AND created_at >= ${since}
-       ORDER BY created_at DESC
-       LIMIT 5`,
-    ),
+    LlmGatewayLog.aggregate<ErrorAggRow>([
+      { $match: { ...matchSince, error: { $ne: null } } },
+      { $sort: { created_at: -1 } },
+      { $limit: 5 },
+      {
+        $project: {
+          _id: 0,
+          task_name: 1,
+          provider: 1,
+          model: 1,
+          error: 1,
+          created_at: 1,
+        },
+      },
+    ]),
   ])
 
-  const total = Number(totalsRow?.['total_calls'] ?? 0)
-  const cached = Number(totalsRow?.['cached_calls'] ?? 0)
+  const totalsRow = totalsRows[0]
+  const total = Number(totalsRow?.total_calls ?? 0)
+  const cached = Number(totalsRow?.cached_calls ?? 0)
 
   const totals: LlmStatsTotals = {
     totalCalls: total,
-    successfulCalls: Number(totalsRow?.['success_calls'] ?? 0),
+    successfulCalls: Number(totalsRow?.success_calls ?? 0),
     cachedCalls: cached,
-    erroredCalls: Number(totalsRow?.['errored_calls'] ?? 0),
-    totalCostUsd: Math.round(Number(totalsRow?.['total_cost'] ?? 0) * 1_000_000) / 1_000_000,
-    totalInputTokens: Number(totalsRow?.['in_tokens'] ?? 0),
-    totalOutputTokens: Number(totalsRow?.['out_tokens'] ?? 0),
-    avgLatencyMs: Math.round(Number(totalsRow?.['avg_latency'] ?? 0)),
+    erroredCalls: Number(totalsRow?.errored_calls ?? 0),
+    totalCostUsd: Math.round(Number(totalsRow?.total_cost ?? 0) * 1_000_000) / 1_000_000,
+    totalInputTokens: Number(totalsRow?.in_tokens ?? 0),
+    totalOutputTokens: Number(totalsRow?.out_tokens ?? 0),
+    avgLatencyMs: Math.round(Number(totalsRow?.avg_latency ?? 0)),
     cacheHitRate: rate(cached, total),
   }
 
-  const toBreakdown = (rows: Record<string, unknown>[]): LlmStatsBreakdown[] =>
+  const toBreakdown = (rows: BreakdownAggRow[]): LlmStatsBreakdown[] =>
     rows.map((r) => {
-      const calls = Number(r['calls'] ?? 0)
+      const calls = Number(r.calls ?? 0)
       return {
-        key: String(r['k'] ?? '(none)'),
+        key: String(r._id ?? '(none)'),
         calls,
-        costUsd: Math.round(Number(r['cost'] ?? 0) * 1_000_000) / 1_000_000,
-        avgLatencyMs: Math.round(Number(r['lat'] ?? 0)),
-        cachedRate: rate(Number(r['cached_calls'] ?? 0), calls),
+        costUsd: Math.round(Number(r.cost ?? 0) * 1_000_000) / 1_000_000,
+        avgLatencyMs: Math.round(Number(r.lat ?? 0)),
+        cachedRate: rate(Number(r.cached_calls ?? 0), calls),
       }
     })
 
@@ -185,11 +231,11 @@ export async function getLlmStats(days: number = 1): Promise<LlmStats> {
     byProvider: toBreakdown(byProviderRows),
     byModel: toBreakdown(byModelRows),
     recentErrors: errorRows.map((r) => ({
-      taskName: (r['task_name'] as string | null) ?? null,
-      provider: (r['provider'] as string | null) ?? null,
-      model: (r['model'] as string | null) ?? null,
-      error: String(r['error'] ?? ''),
-      createdAt: String(r['created_at'] ?? ''),
+      taskName: r.task_name ?? null,
+      provider: r.provider ?? null,
+      model: r.model ?? null,
+      error: String(r.error ?? ''),
+      createdAt: r.created_at ? new Date(r.created_at).toISOString() : '',
     })),
   }
 }
@@ -200,17 +246,16 @@ export async function getLlmStats(days: number = 1): Promise<LlmStats> {
  * when it decides to throw `CostCapExceededError`.
  */
 export async function getCostCapStatus(): Promise<CostCapStatus> {
-  const [spentRow, capRaw] = await Promise.all([
-    dbGet(
-      `SELECT COALESCE(SUM(cost_usd), 0) AS spent
-       FROM llm_gateway_logs
-       WHERE error IS NULL
-         AND created_at >= datetime('now', '-1 day')`,
-    ),
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000)
+  const [spentAgg, capRaw] = await Promise.all([
+    LlmGatewayLog.aggregate<{ spent: number }>([
+      { $match: { error: null, created_at: { $gte: since } } },
+      { $group: { _id: null, spent: { $sum: '$cost_usd' } } },
+    ]),
     getSetting('llm.cost_cap_usd_per_day'),
   ])
 
-  const spent = Math.round(Number(spentRow?.['spent'] ?? 0) * 1_000_000) / 1_000_000
+  const spent = Math.round(Number(spentAgg[0]?.spent ?? 0) * 1_000_000) / 1_000_000
   const capNum = capRaw === null ? 1.0 : Number(capRaw)
   const cap = Number.isFinite(capNum) && capNum > 0 ? capNum : 0
 

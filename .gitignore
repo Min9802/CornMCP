@@ -20,3 +20,5 @@ plan.*.md
 *_plan.md
 
 infra/*-data
+MIGRATION_*.md
+MIGRATION_SQLITE_TO_MONGO.md.native.bak

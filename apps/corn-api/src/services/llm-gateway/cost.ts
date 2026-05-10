@@ -17,7 +17,7 @@
 //     collectively over-spend by at most (maxConcurrent * maxCostPerCall).
 //     For cap=$1/day that's ~$0.05 overrun — acceptable. Document in risk R2.
 
-import { dbGet } from '../../db/client.js'
+import { LlmGatewayLog } from '../../db/mongoose/index.js'
 import { getSetting } from '../settings.js'
 import { CostCapExceededError } from './types.js'
 import type { ProviderType } from './types.js'
@@ -115,17 +115,19 @@ export function _resetCostCapCacheForTests(): void {
 
 /**
  * Read `SUM(cost_usd)` over the last 24h, cached per 60s.
+ * Mongo equivalent of the legacy SQL `SUM(cost_usd) WHERE error IS NULL
+ * AND created_at >= datetime('now', '-1 day')`.
  */
 async function getSpentUsdToday(): Promise<number> {
   const now = Date.now()
   if (capCache && capCache.expiresAt > now) return capCache.spent
-  const row = await dbGet(
-    `SELECT COALESCE(SUM(cost_usd), 0) AS total
-     FROM llm_gateway_logs
-     WHERE error IS NULL
-       AND created_at >= datetime('now', '-1 day')`,
-  )
-  const spent = Number(row?.['total'] ?? 0)
+
+  const since = new Date(now - 24 * 60 * 60 * 1000)
+  const result = await LlmGatewayLog.aggregate<{ total: number }>([
+    { $match: { error: null, created_at: { $gte: since } } },
+    { $group: { _id: null, total: { $sum: '$cost_usd' } } },
+  ])
+  const spent = Number(result[0]?.total ?? 0)
   capCache = { spent, expiresAt: now + CAP_CACHE_TTL_MS }
   return spent
 }

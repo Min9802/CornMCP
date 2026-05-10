@@ -4,11 +4,86 @@ import { writeFile, rename } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createLogger } from '@corn/shared-utils'
+import { connectMongoose } from './mongoose/connection.js'
+import { initSchemas } from './mongoose/init.js'
+import { runMigrations } from './mongoose/migrations/_runner.js'
 
 const logger = createLogger('db')
 
 let db: Database | null = null
 let dbPath: string = ''
+
+// ─── Driver toggle (cutover) ───────────────────────────────
+// During Phase 1-3 the codebase is mid-refactor: most call sites still
+// use the dbRun/dbAll/dbGet helpers below (sql.js path) while new code can
+// use Mongoose Models. After Phase 3 the helpers go away and only the
+// Mongoose path remains. `initDatabase()` is the single entry point that
+// callers use at startup; it branches on `DATABASE_DRIVER`:
+//   - sqlite → boot sql.js via getDb() (current behavior)
+//   - mongo  → boot Mongoose via connectMongoose() — sql.js helpers below
+//             will throw if called, since Phase 3 is supposed to have
+//             removed every dbRun/dbAll/dbGet site by then.
+type DatabaseDriver = 'sqlite' | 'mongo'
+let activeDriver: DatabaseDriver | null = null
+
+function readDriver(): DatabaseDriver {
+  const raw = (process.env['DATABASE_DRIVER'] || 'sqlite').toLowerCase()
+  if (raw !== 'sqlite' && raw !== 'mongo') {
+    throw new Error(
+      `Invalid DATABASE_DRIVER="${raw}". Must be "sqlite" or "mongo".`,
+    )
+  }
+  return raw
+}
+
+/**
+ * Single entry point for DB initialization. Idempotent — safe to call
+ * multiple times. Branches on `DATABASE_DRIVER`:
+ *   - sqlite → loads sql.js + applies schema/migrations
+ *   - mongo  → opens Mongoose connection (schema sync handled by initSchemas)
+ *
+ * Caller (`apps/corn-api/src/index.ts`) invokes this once at startup.
+ */
+export async function initDatabase(): Promise<void> {
+  if (activeDriver) return
+  const driver = readDriver()
+  if (driver === 'mongo') {
+    const uri = process.env['MONGODB_URI']
+    if (!uri) {
+      throw new Error('MONGODB_URI is required when DATABASE_DRIVER=mongo')
+    }
+    await connectMongoose(uri)
+    // Order: indexes first (so unique constraints exist before any seed
+    // tries to insert duplicates), then the migration runner picks up
+    // any post-cutover transforms.
+    await initSchemas()
+    await runMigrations()
+    activeDriver = 'mongo'
+    logger.info('Database driver: mongo')
+    return
+  }
+  // sqlite branch — kick off the legacy initializer so the helpers below
+  // are immediately usable.
+  await getDb()
+  activeDriver = 'sqlite'
+  logger.info('Database driver: sqlite')
+}
+
+export function getActiveDriver(): DatabaseDriver | null {
+  return activeDriver
+}
+
+function assertSqliteActive(op: string): void {
+  // Only enforce once initDatabase() has run; lazy `getDb()` calls during
+  // schema bootstrap (before initDatabase resolves) are still valid.
+  if (activeDriver === 'mongo') {
+    throw new Error(
+      `[db] ${op}() called while DATABASE_DRIVER=mongo. ` +
+        `This call site has not been migrated to Mongoose yet — see ` +
+        `MIGRATION_SQLITE_TO_MONGO.md Phase 3.`,
+    )
+  }
+}
 
 // ── Debounced async persistence ──────────────────────────
 // Background: sql.js holds the DB in memory. Persisting historically meant
@@ -300,6 +375,7 @@ export function closeDb(): void {
 
 // Helper to run a query and return all rows as objects
 export async function dbAll(sql: string, params: unknown[] = []): Promise<Record<string, unknown>[]> {
+  assertSqliteActive('dbAll')
   const database = await getDb()
   const stmt = database.prepare(sql)
   if (params.length > 0) stmt.bind(params as SqlValue[])
@@ -314,6 +390,7 @@ export async function dbAll(sql: string, params: unknown[] = []): Promise<Record
 
 // Helper to run a query and return the first row
 export async function dbGet(sql: string, params: unknown[] = []): Promise<Record<string, unknown> | undefined> {
+  assertSqliteActive('dbGet')
   const rows = await dbAll(sql, params)
   return rows[0]
 }
@@ -322,6 +399,7 @@ export async function dbGet(sql: string, params: unknown[] = []): Promise<Record
 // The disk write is debounced — see `scheduleSave` above. Callers that need a
 // hard durability guarantee before returning should `await flushDb()` after.
 export async function dbRun(sql: string, params: unknown[] = []): Promise<void> {
+  assertSqliteActive('dbRun')
   const database = await getDb()
   database.run(sql, params as SqlValue[])
   scheduleSave()
