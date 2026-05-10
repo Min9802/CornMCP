@@ -4,6 +4,13 @@ import type { McpEnv } from '@corn/shared-types'
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { join, resolve, normalize, relative } from 'node:path'
+import { runTask } from '../services/task-dispatcher.js'
+import {
+  CODE_RERANK_TASK_NAME,
+  registerCodeRerankTask,
+  type CodeRerankInput,
+  type CodeRerankResult,
+} from './code-rerank.js'
 
 /**
  * Code intelligence tools — powered by native TypeScript AST engine.
@@ -11,6 +18,8 @@ import { join, resolve, normalize, relative } from 'node:path'
  */
 export function registerCodeTools(server: McpServer, env: McpEnv) {
   const apiUrl = () => (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
+  // Register the code-rerank task once per process. Idempotent.
+  registerCodeRerankTask()
 
   // ── Resolve project root for local fallbacks ──
   function getProjectRoot(): string {
@@ -347,6 +356,64 @@ export function registerCodeTools(server: McpServer, env: McpEnv) {
         return { content: [{ type: 'text' as const, text: lines.join('\n') }] }
       } catch (error) {
         return { content: [{ type: 'text' as const, text: `List repos error: ${error instanceof Error ? error.message : 'Unknown'}` }], isError: true }
+      }
+    },
+  )
+
+  // ── corn_code_rerank — rerank search hits by intent (S7.6) ──
+  server.tool(
+    'corn_code_rerank',
+    'Rerank a list of code search hits by relevance to a natural-language query. Heuristic = sort by supplied upstream score. LLM mode re-scores each item 0-1 with reasoning. Advisory: use on the output of corn_code_search (or any code hit list) when ordering matters more than raw recall.',
+    {
+      query: z.string().describe('Intent / question. Shape: natural language.'),
+      items: z
+        .array(
+          z.object({
+            id: z.string().describe('Stable id (file:line, symbol name, or opaque handle).'),
+            snippet: z.string().describe('Code excerpt or context used to judge relevance.'),
+            score: z.number().optional().describe('Optional upstream score (higher = better).'),
+          }),
+        )
+        .min(1)
+        .describe('Items to rerank. Pass the raw hits from corn_code_search.'),
+      topK: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe('Cap the number of items the LLM reranks. Tail kept verbatim. Default 10.'),
+    },
+    async ({ query, items, topK }) => {
+      try {
+        const { result, metadata } = await runTask<CodeRerankInput, CodeRerankResult>(
+          CODE_RERANK_TASK_NAME,
+          { query, items, topK },
+          env,
+        )
+        const fallback = metadata.fellBack ? ` · fallback (${metadata.llmError ?? 'llm error'})` : ''
+        const engine = metadata.engineUsed === 'llm' ? '🤖 LLM' : '⚙️ Heuristic'
+        const lines = [
+          `🔁 **Code Rerank** (${engine}${fallback}) — ${result.items.length} items`,
+          '',
+          '| # | Id | Score | Reason |',
+          '|---|----|-------|--------|',
+        ]
+        result.items.forEach((it, i) => {
+          const reason = it.reason ? it.reason.replace(/\|/g, '\\|').slice(0, 120) : ''
+          lines.push(`| ${i + 1} | \`${it.id}\` | ${it.score.toFixed(3)} | ${reason} |`)
+        })
+        return { content: [{ type: 'text' as const, text: lines.join('\n') }] }
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Rerank error: ${error instanceof Error ? error.message : 'Unknown'}`,
+            },
+          ],
+          isError: true,
+        }
       }
     },
   )

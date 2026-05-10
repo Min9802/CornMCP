@@ -2,6 +2,14 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import type { McpEnv } from '@corn/shared-types'
 import { generateId } from '@corn/shared-utils'
+import { registerTask, runTask } from '../services/task-dispatcher.js'
+import { runHeuristic, runLlm, type PlanQualityResult } from './plan-quality.js'
+import {
+  registerQualityAssistTask,
+  QUALITY_ASSIST_TASK_NAME,
+  type QualityAssistInput,
+  type QualityAssistResult,
+} from './quality-assist.js'
 
 function apiHeaders(env: McpEnv): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -132,6 +140,16 @@ export function registerQualityTools(server: McpServer, env: McpEnv) {
   // ─── Plan Quality ────────────────────────────────────
   const PLAN_QUALITY_THRESHOLD = 80
 
+  // Register the task with the dispatcher exactly once per process. The
+  // heuristic handler is the legacy keyword scorer; the LLM handler
+  // sends the plan through the gateway with a structured-output prompt.
+  // Engine selection (heuristic vs llm) and fallback policy live in DB
+  // (`task_engine_config`) so admin can flip without redeploy.
+  registerTask<{ plan: string }, PlanQualityResult>('plan_quality', {
+    heuristic: ({ plan }) => runHeuristic(plan),
+    llm: async ({ plan }, ctx) => runLlm(plan, ctx),
+  })
+
   server.tool(
     'corn_plan_quality',
     'Assess the quality of a plan before execution. Scores against 8 criteria: clarity, scope, risks, testing, reversibility, impact, dependencies, timeline. Plans MUST score ≥80% to proceed.',
@@ -139,28 +157,15 @@ export function registerQualityTools(server: McpServer, env: McpEnv) {
       plan: z.string().describe('The plan text to assess'),
       projectId: z.string().optional().describe('Project context'),
     },
-    async ({ plan, projectId }) => {
-      // Simple heuristic scoring — in production, send to LLM for analysis
-      const criteria = [
-        { name: 'Clarity', icon: '📝', check: plan.length > 50, hint: 'Plan should be detailed (>50 chars)' },
-        { name: 'Scope', icon: '🎯', check: plan.includes('file') || plan.includes('change'), hint: 'Mention specific files or changes to make' },
-        { name: 'Risks', icon: '⚡', check: plan.toLowerCase().includes('risk') || plan.toLowerCase().includes('backup'), hint: 'Address potential risks or backup strategy' },
-        { name: 'Testing', icon: '🧪', check: plan.toLowerCase().includes('test') || plan.toLowerCase().includes('verify'), hint: 'Include test/verification steps' },
-        { name: 'Reversibility', icon: '↩️', check: plan.toLowerCase().includes('revert') || plan.toLowerCase().includes('rollback'), hint: 'Describe rollback strategy if something goes wrong' },
-        { name: 'Impact', icon: '💥', check: plan.toLowerCase().includes('impact') || plan.toLowerCase().includes('affect'), hint: 'Describe what downstream systems or users are affected' },
-        { name: 'Dependencies', icon: '🔗', check: plan.toLowerCase().includes('depend') || plan.toLowerCase().includes('require'), hint: 'List what this plan depends on or requires' },
-        { name: 'Timeline', icon: '📅', check: plan.toLowerCase().includes('step') || plan.toLowerCase().includes('phase'), hint: 'Break into numbered steps or phases' },
-      ]
+    async ({ plan }) => {
+      const { result, metadata } = await runTask<{ plan: string }, PlanQualityResult>(
+        'plan_quality',
+        { plan },
+        env as McpEnv,
+      )
 
-      const scored = criteria.map((c) => ({
-        ...c,
-        score: c.check ? 10 : 3,
-      }))
-
-      const total = scored.reduce((sum, c) => sum + c.score, 0)
-      const maxScore = criteria.length * 10
-      const percentage = Math.round((total / maxScore) * 100)
-      const passedCount = scored.filter((c) => c.score >= 7).length
+      const scored = result.criteria
+      const { total, maxScore, percentage, passedCount } = result
       const failedCriteria = scored.filter((c) => c.score < 7)
       const meetsThreshold = percentage >= PLAN_QUALITY_THRESHOLD
       const { grade, emoji, label } = gradeInfo(percentage)
@@ -169,17 +174,27 @@ export function registerQualityTools(server: McpServer, env: McpEnv) {
 
       lines.push(`## 📋 Plan Quality Assessment — Grade ${grade}`)
       lines.push('')
+      // Surface the engine that produced the score so an agent can tell
+      // whether the assessment came from heuristic vs LLM, and whether
+      // an LLM error caused a fallback.
+      const engineBadge = metadata.engineUsed === 'llm' ? '🤖 LLM' : '⚙️ Heuristic'
+      const fallbackNote = metadata.fellBack ? ` _(fell back from LLM: ${metadata.llmError ?? 'unknown error'})_` : ''
+      lines.push(`> Engine: **${engineBadge}**${fallbackNote}`)
+      lines.push('')
       lines.push(`| Overall Score | Grade | Criteria Passed | Threshold | Status |`)
       lines.push(`|:------------:|:-----:|:---------------:|:---------:|:------:|`)
       lines.push(`| **${percentage}%** (${total}/${maxScore}) | ${emoji} **${grade}** — ${label} | ${passedCount}/${scored.length} | ${PLAN_QUALITY_THRESHOLD}% | ${meetsThreshold ? '✅ APPROVED' : '🚫 REJECTED'} |`)
       lines.push('')
       lines.push(`### Criteria Breakdown`)
       lines.push('')
-      lines.push(`| # | Criteria | Score | Bar | Status | Hint |`)
+      lines.push(`| # | Criteria | Score | Bar | Status | Hint / Reason |`)
       lines.push(`|:-:|:---------|------:|:----|:------:|:-----|`)
       scored.forEach((c, i) => {
         const status = c.score >= 7 ? '✅ Pass' : '❌ Fail'
-        lines.push(`| ${i + 1} | ${c.icon} ${c.name} | **${c.score}**/10 | \`${scoreBar(c.score, 10, 8)}\` | ${status} | ${c.score >= 7 ? '—' : c.hint} |`)
+        // LLM path supplies a justification; heuristic path uses the hint
+        // when the criterion failed. Pass criteria show '—'.
+        const note = c.reason ?? (c.score >= 7 ? '—' : c.hint)
+        lines.push(`| ${i + 1} | ${c.icon} ${c.name} | **${c.score}**/10 | \`${scoreBar(c.score, 10, 8)}\` | ${status} | ${note} |`)
       })
       lines.push('')
 
@@ -210,6 +225,100 @@ export function registerQualityTools(server: McpServer, env: McpEnv) {
       return {
         content: [{ type: 'text' as const, text: lines.join('\n') }],
         isError: !meetsThreshold,
+      }
+    },
+  )
+
+  // ─── Quality Report Assist (S7.4) ────────────────────
+  // Advisory tool: takes free-form change context and returns SUGGESTED
+  // scores for the 4 quality dimensions so an agent can preview before
+  // calling `corn_quality_report` with hand-picked numbers. This tool
+  // never submits to the DB — keeping the submit path unchanged means
+  // S7.4 is zero-regression to the existing quality-gate flow.
+  registerQualityAssistTask()
+
+  server.tool(
+    'corn_quality_report_assist',
+    'Suggest scores for corn_quality_report 4 dimensions (Build/Regression/Standards/Traceability) from change context (git diff, changed files, test output, summary). Advisory only — does NOT submit a quality report. Review the output, adjust if needed, then call corn_quality_report with the final scores.',
+    {
+      summary: z.string().optional().describe('Session/commit/PR summary (what changed and why)'),
+      changedFiles: z.array(z.string()).optional().describe('Relative paths of modified files'),
+      testResults: z.string().optional().describe('Test runner output or summary (e.g. "20/20 PASS")'),
+      gitDiff: z.string().optional().describe('Git diff text (will be truncated internally)'),
+      agentReasoning: z.string().optional().describe('Extra reasoning the agent wants the model to consider'),
+    },
+    async ({ summary, changedFiles, testResults, gitDiff, agentReasoning }) => {
+      const { result, metadata } = await runTask<QualityAssistInput, QualityAssistResult>(
+        QUALITY_ASSIST_TASK_NAME,
+        { summary, changedFiles, testResults, gitDiff, agentReasoning },
+        env as McpEnv,
+      )
+
+      const total =
+        result.scoreBuild + result.scoreRegression + result.scoreStandards + result.scoreTraceability
+      const { grade, emoji, label } = gradeInfo(total)
+      const passed = total >= 60
+
+      const engineBadge = metadata.engineUsed === 'llm' ? '🤖 LLM' : '⚙️ Heuristic'
+      const fallbackNote = metadata.fellBack
+        ? ` _(fell back from LLM: ${metadata.llmError ?? 'unknown error'})_`
+        : ''
+
+      const dimensions = [
+        { name: 'Build Quality', score: result.scoreBuild, key: 'scoreBuild' },
+        { name: 'Regression Check', score: result.scoreRegression, key: 'scoreRegression' },
+        { name: 'Standards Compliance', score: result.scoreStandards, key: 'scoreStandards' },
+        { name: 'Change Traceability', score: result.scoreTraceability, key: 'scoreTraceability' },
+      ]
+
+      const lines: string[] = []
+      lines.push(`## 🔍 Quality Report — Suggested Scores (${engineBadge})${fallbackNote}`)
+      lines.push('')
+      lines.push(`> **Advisory only** — this tool does NOT submit a quality report. Review the scores below, adjust if needed, then call \`corn_quality_report\` with the final numbers.`)
+      lines.push('')
+      lines.push(`| Suggested Total | Grade | Meets 60/100 gate? |`)
+      lines.push(`|:---------------:|:-----:|:------------------:|`)
+      lines.push(`| **${total}/100** | ${emoji} ${grade} — ${label} | ${passed ? '✅ Yes' : '❌ No'} |`)
+      lines.push('')
+      lines.push(`### Suggested Breakdown`)
+      lines.push('')
+      lines.push(`| Dimension | Score | Bar | Rating |`)
+      lines.push(`|:----------|------:|:----|:------:|`)
+      for (const d of dimensions) {
+        const pct = Math.round((d.score / 25) * 100)
+        const rating = pct >= 80 ? '🟢' : pct >= 60 ? '🟡' : '🔴'
+        lines.push(`| ${d.name} | **${d.score}**/25 | \`${scoreBar(d.score, 25)}\` | ${rating} ${pct}% |`)
+      }
+      lines.push('')
+      if (result.reasoning) {
+        lines.push(`### Reasoning`)
+        lines.push('')
+        lines.push(`> ${result.reasoning}`)
+        lines.push('')
+      }
+      lines.push(`### Next step — submit the report`)
+      lines.push('')
+      lines.push('```json')
+      lines.push(
+        JSON.stringify(
+          {
+            scoreBuild: result.scoreBuild,
+            scoreRegression: result.scoreRegression,
+            scoreStandards: result.scoreStandards,
+            scoreTraceability: result.scoreTraceability,
+          },
+          null,
+          2,
+        ),
+      )
+      lines.push('```')
+      lines.push('')
+      lines.push(
+        `Copy the JSON above into a \`corn_quality_report\` call with a \`gateName\` (e.g. \`"post-task"\`) and optional \`details\`. Adjust scores first if you disagree with the assessment.`,
+      )
+
+      return {
+        content: [{ type: 'text' as const, text: lines.join('\n') }],
       }
     },
   )

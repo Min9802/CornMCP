@@ -2,6 +2,20 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import type { McpEnv } from '@corn/shared-types'
 import { generateId } from '@corn/shared-utils'
+import { runTask } from '../services/task-dispatcher.js'
+import {
+  SESSION_SUMMARY_TASK_NAME,
+  registerSessionSummaryTask,
+  type SessionSummaryInput,
+  type SessionSummaryResult,
+} from './session-summary.js'
+
+/**
+ * Threshold above which `corn_session_end` runs the summary through the
+ * dispatcher (heuristic by default, LLM if admin enabled it). Below the
+ * threshold the user-supplied summary passes through unchanged.
+ */
+const SUMMARY_COMPRESS_THRESHOLD = 500
 
 function apiHeaders(env: McpEnv): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -10,6 +24,9 @@ function apiHeaders(env: McpEnv): Record<string, string> {
 }
 
 export function registerSessionTools(server: McpServer, env: McpEnv) {
+  // Wire the session-summary task with the dispatcher. Idempotent.
+  registerSessionSummaryTask()
+
   // ─── Start Session ───────────────────────────────────
   server.tool(
     'corn_session_start',
@@ -64,13 +81,38 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
     'End the current work session. Provide a summary of changes and decisions for handoff.',
     {
       sessionId: z.string().describe('Session ID from corn_session_start'),
-      summary: z.string().describe('Summary of what was accomplished'),
+      summary: z.string().describe(`Summary of what was accomplished. If longer than ${SUMMARY_COMPRESS_THRESHOLD} chars, the server compresses it to 2-4 sentences for handoff (heuristic by default; LLM mode toggleable in admin UI). Best-effort: any error keeps the original summary.`),
       filesChanged: z.array(z.string()).optional().describe('List of files modified'),
       decisions: z.array(z.string()).optional().describe('Key decisions made'),
       blockers: z.array(z.string()).optional().describe('Remaining blockers'),
     },
     async ({ sessionId, summary, filesChanged, decisions, blockers }) => {
       const agentId = (env as McpEnv & { API_KEY_OWNER?: string }).API_KEY_OWNER || 'unknown'
+
+      // Compress long summaries through the dispatcher. The user's
+      // original full text still goes through the API call below — this
+      // only replaces what gets stored as the canonical handoff line.
+      // Best-effort: any error keeps the original summary intact.
+      const originalLen = summary.length
+      let finalSummary = summary
+      let summaryNote = ''
+      if (originalLen > SUMMARY_COMPRESS_THRESHOLD) {
+        try {
+          const { result, metadata } = await runTask<SessionSummaryInput, SessionSummaryResult>(
+            SESSION_SUMMARY_TASK_NAME,
+            { text: summary },
+            env,
+          )
+          if (result.summary) {
+            finalSummary = result.summary
+            const fallback = metadata.fellBack ? ', fallback' : ''
+            summaryNote = `\n📝 Summary compressed: ${originalLen} → ${finalSummary.length} chars (${metadata.engineUsed}${fallback})`
+          }
+        } catch {
+          // Silent: registry mis-config or both engines failed → keep
+          // original summary. session_end never blocks on summary.
+        }
+      }
 
       // Update session in Dashboard API
       try {
@@ -80,7 +122,7 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
           headers: apiHeaders(env),
           body: JSON.stringify({
             status: 'completed',
-            summary,
+            summary: finalSummary,
             filesChanged: filesChanged || [],
             decisions: decisions || [],
             blockers: blockers || [],
@@ -92,7 +134,8 @@ export function registerSessionTools(server: McpServer, env: McpEnv) {
         // Best effort
       }
 
-      const parts = [`✅ Session ${sessionId} completed`, `\nSummary: ${summary}`]
+      const parts = [`✅ Session ${sessionId} completed`, `\nSummary: ${finalSummary}`]
+      if (summaryNote) parts.push(summaryNote)
       if (filesChanged?.length) parts.push(`\nFiles: ${filesChanged.join(', ')}`)
       if (decisions?.length) parts.push(`\nDecisions:\n${decisions.map((d) => `  • ${d}`).join('\n')}`)
       if (blockers?.length) parts.push(`\n⚠️ Blockers:\n${blockers.map((b) => `  • ${b}`).join('\n')}`)

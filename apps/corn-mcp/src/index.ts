@@ -12,6 +12,7 @@ import { registerSessionTools } from './tools/session.js'
 import { registerCodeTools } from './tools/code.js'
 import { registerAnalyticsTools } from './tools/analytics.js'
 import { registerChangeTools } from './tools/changes.js'
+import { registerAdvisoryTools } from './tools/advisory.js'
 import { validateApiKey } from './middleware/auth.js'
 import { estimateComputeTokens, estimateTokensSaved } from './telemetry/estimate.js'
 import type { Env } from './types.js'
@@ -153,18 +154,23 @@ app.get('/', (c) => {
       'corn_knowledge_store',
       'corn_knowledge_search',
       'corn_quality_report',
+      'corn_quality_report_assist',
       'corn_plan_quality',
       'corn_session_start',
       'corn_session_end',
       'corn_code_search',
       'corn_code_impact',
       'corn_code_context',
+      'corn_code_rerank',
       'corn_detect_changes',
       'corn_cypher',
       'corn_list_repos',
       'corn_code_read',
       'corn_tool_stats',
       'corn_changes',
+      'corn_anomaly_check',
+      'corn_token_count',
+      'corn_chat',
     ],
   })
 })
@@ -183,6 +189,7 @@ export function createMcpServer(env: Env) {
   registerCodeTools(server, env)
   registerAnalyticsTools(server, env)
   registerChangeTools(server, env)
+  registerAdvisoryTools(server, env)
   return server
 }
 
