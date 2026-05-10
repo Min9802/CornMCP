@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import { ConfirmProvider } from '@/components/ConfirmProvider'
 
 export const metadata: Metadata = {
   title: 'Corn Hub — AI Agent Intelligence',
@@ -9,7 +10,9 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <ConfirmProvider>{children}</ConfirmProvider>
+      </body>
     </html>
   )
 }

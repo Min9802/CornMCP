@@ -20,6 +20,7 @@ const NAV_ITEMS = [
   { href: '/keys', icon: '🔑', label: 'API Keys' },
   { href: '/orgs', icon: '🏢', label: 'Organizations' },
   { href: '/users', icon: '👥', label: 'Users', adminOnly: true },
+  { href: '/admin/system-settings', icon: '🔧', label: 'System Settings', adminOnly: true },
   { href: '/settings', icon: '⚙️', label: 'Settings' },
   { href: '/setup', icon: '📖', label: 'Installation' },
 ]

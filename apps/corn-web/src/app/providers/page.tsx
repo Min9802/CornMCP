@@ -3,6 +3,7 @@ import { useState } from 'react'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getProviders, createProvider, deleteProvider, updateProvider } from '@/lib/api'
+import { useConfirm, useToast } from '@/components/ConfirmProvider'
 
 const PROVIDER_TYPES = [
   { value: 'openai', label: '🟢 OpenAI', icon: '🟢' },
@@ -27,6 +28,8 @@ const TYPE_ICONS: Record<string, string> = { openai: '🟢', anthropic: '🟣', 
 
 export default function ProvidersPage() {
   const { data, mutate } = useSWR('providers', getProviders, { refreshInterval: 30000 })
+  const confirm = useConfirm()
+  const toast = useToast()
   const [showForm, setShowForm] = useState(false)
   const [editId, setEditId] = useState<string | null>(null)
   const [name, setName] = useState('')
@@ -78,9 +81,20 @@ export default function ProvidersPage() {
   }
 
   const handleDelete = async (id: string) => {
-    if (!confirm('Delete this provider?')) return
-    await deleteProvider(id)
-    mutate()
+    const ok = await confirm({
+      title: 'Delete provider',
+      message: 'Delete this provider? Tasks routed to it will fail until reconfigured.',
+      variant: 'danger',
+      confirmLabel: 'Delete',
+    })
+    if (!ok) return
+    try {
+      await deleteProvider(id)
+      mutate()
+      toast({ kind: 'success', message: 'Provider removed' })
+    } catch (e: any) {
+      toast({ kind: 'error', message: e?.message?.replace(/^API \d+: /, '') || 'Delete failed' })
+    }
   }
 
   const preset = PRESETS[type]

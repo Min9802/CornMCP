@@ -4,9 +4,12 @@ import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getProjects, createProject, updateProject, deleteProject } from '@/lib/api'
 import { formatLocalDate } from '@/lib/date'
+import { useConfirm, useToast } from '@/components/ConfirmProvider'
 
 export default function ProjectsPage() {
   const { data, mutate } = useSWR('projects', getProjects, { refreshInterval: 30000 })
+  const confirm = useConfirm()
+  const toast = useToast()
   const [showForm, setShowForm] = useState(false)
   const [editId, setEditId] = useState<string | null>(null)
   const [name, setName] = useState('')
@@ -38,8 +41,20 @@ export default function ProjectsPage() {
   }
 
   const handleDelete = async (id: string, projectName: string) => {
-    if (!confirm(`Delete project "${projectName}"? This will also remove all indexed symbols and jobs.`)) return
-    await deleteProject(id); mutate()
+    const ok = await confirm({
+      title: 'Delete project',
+      message: `Delete project "${projectName}"?\n\nThis will also remove all indexed symbols and jobs. Cannot be undone.`,
+      variant: 'danger',
+      confirmLabel: 'Delete project',
+    })
+    if (!ok) return
+    try {
+      await deleteProject(id)
+      mutate()
+      toast({ kind: 'success', message: `Deleted project "${projectName}"` })
+    } catch (e: any) {
+      toast({ kind: 'error', message: e?.message?.replace(/^API \d+: /, '') || 'Delete failed' })
+    }
   }
 
   return (

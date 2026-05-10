@@ -4,9 +4,12 @@ import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getOrganizations, createOrganization, updateOrganization, deleteOrganization } from '@/lib/api'
 import { formatLocalDate } from '@/lib/date'
+import { useConfirm, useToast } from '@/components/ConfirmProvider'
 
 export default function OrgsPage() {
   const { data, mutate } = useSWR('orgs', getOrganizations, { refreshInterval: 30000 })
+  const confirm = useConfirm()
+  const toast = useToast()
   const [showForm, setShowForm] = useState(false)
   const [editId, setEditId] = useState<string | null>(null)
   const [name, setName] = useState('')
@@ -31,8 +34,20 @@ export default function OrgsPage() {
   }
 
   const handleDelete = async (id: string, orgName: string) => {
-    if (!confirm(`Delete organization "${orgName}"?`)) return
-    await deleteOrganization(id); mutate()
+    const ok = await confirm({
+      title: 'Delete organization',
+      message: `Delete organization "${orgName}"?`,
+      variant: 'danger',
+      confirmLabel: 'Delete',
+    })
+    if (!ok) return
+    try {
+      await deleteOrganization(id)
+      mutate()
+      toast({ kind: 'success', message: `Deleted organization "${orgName}"` })
+    } catch (e: any) {
+      toast({ kind: 'error', message: e?.message?.replace(/^API \d+: /, '') || 'Delete failed' })
+    }
   }
 
   return (

@@ -229,3 +229,231 @@ export const updateUser = (id: string, data: { name?: string; role?: string; isA
 export const deleteUser = (id: string) =>
   apiFetch<{ ok: boolean }>(`/api/users/${id}`, { method: 'DELETE' })
 
+// ─── System Settings (admin only) — S3 ───────────────────
+export interface SystemSetting {
+  key: string
+  is_secret: 0 | 1
+  category: string
+  description: string | null
+  default_value: string | null
+  updated_by: string | null
+  updated_at: string
+  value_set: boolean
+  /** '' if not set; raw value if !is_secret; ••••<last4> if is_secret */
+  value_masked: string
+}
+
+export interface SystemSettingDefault {
+  key: string
+  category: string
+  description: string
+  isSecret: boolean
+  envVar?: string
+  defaultValue?: string
+}
+
+export interface SystemSettingAudit {
+  id: number
+  key: string
+  old_value: string | null
+  new_value: string | null
+  action: string
+  changed_by: string | null
+  changed_at: string
+}
+
+export interface SystemSettingReveal {
+  key: string
+  value: string | null
+  is_secret: boolean
+  source: 'db' | 'env' | 'none'
+  rate_limit: { remaining: number }
+}
+
+export interface MigrateFromEnvResult {
+  migrated: string[]
+  skipped: { key: string; reason: 'already_set' | 'no_env' | 'env_empty' }[]
+}
+
+export const getSystemSettings = (category?: string) => {
+  const qs = category ? `?category=${encodeURIComponent(category)}` : ''
+  return apiFetch<{ settings: SystemSetting[] }>(`/api/system/settings${qs}`)
+}
+
+export const getSystemSettingDefaults = () =>
+  apiFetch<{ defaults: SystemSettingDefault[] }>('/api/system/settings/defaults')
+
+export const updateSystemSetting = (
+  key: string,
+  body: { value: string | null; isSecret?: boolean; category?: string; description?: string; defaultValue?: string },
+) =>
+  apiFetch<{ ok: boolean }>(`/api/system/settings/${encodeURIComponent(key)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  })
+
+export const revealSystemSetting = (key: string) =>
+  apiFetch<SystemSettingReveal>(`/api/system/settings/${encodeURIComponent(key)}/reveal`)
+
+export const getSystemSettingAudit = (key: string, limit = 50) =>
+  apiFetch<{ entries: SystemSettingAudit[] }>(
+    `/api/system/settings/audit/${encodeURIComponent(key)}?limit=${limit}`,
+  )
+
+export const migrateSystemSettingsFromEnv = () =>
+  apiFetch<MigrateFromEnvResult>('/api/system/settings/migrate-from-env', { method: 'POST' })
+
+// ─── Task Engines (admin only) — S6 ──────────────────────
+export type TaskEngineKind = 'heuristic' | 'llm'
+
+export interface TaskEngineConfig {
+  task_name: string
+  engine: TaskEngineKind
+  provider_id: string | null
+  model: string | null
+  enabled: 0 | 1
+  fallback_to_heuristic: 0 | 1
+  prompt_template: string | null
+  timeout_ms: number
+  max_input_tokens: number
+  max_output_tokens: number
+  temperature: number
+  cache_ttl_sec: number
+  cost_cap_usd_per_day: number
+  description: string | null
+  updated_by: string | null
+  updated_at: string
+}
+
+export interface TaskEngineDefault {
+  taskName: string
+  description: string
+  suggestedModel?: string
+  promptTemplate?: string
+  maxOutputTokens?: number
+}
+
+export interface TaskEngineUpdatePatch {
+  engine?: TaskEngineKind
+  providerId?: string | null
+  model?: string | null
+  enabled?: boolean
+  fallbackToHeuristic?: boolean
+  promptTemplate?: string | null
+  timeoutMs?: number
+  maxInputTokens?: number
+  maxOutputTokens?: number
+  temperature?: number
+  cacheTtlSec?: number
+  costCapUsdPerDay?: number
+  description?: string | null
+}
+
+export interface TaskEngineAuditEntry {
+  id: number
+  task_name: string
+  field: string
+  old_value: string | null
+  new_value: string | null
+  action: 'update' | 'test' | 'reset'
+  changed_by: string | null
+  changed_at: string
+}
+
+export interface TaskEngineTestResult {
+  ok: true
+  result: string
+  costUsd: number
+  latencyMs: number
+  cached: boolean
+  model: string
+  providerId: string
+  inputTokens: number
+  outputTokens: number
+  tokensEstimated: boolean
+}
+
+export interface TaskEngineTestError {
+  ok: false
+  error: string
+  code?: string
+  detail?: string | number
+}
+
+export const getTaskEngines = () =>
+  apiFetch<{ configs: TaskEngineConfig[] }>('/api/system/task-engines')
+
+export const getTaskEngineDefaults = () =>
+  apiFetch<{ defaults: TaskEngineDefault[] }>('/api/system/task-engines/defaults')
+
+export const getTaskEngine = (taskName: string) =>
+  apiFetch<{ config: TaskEngineConfig }>(`/api/system/task-engines/${encodeURIComponent(taskName)}`)
+
+export const updateTaskEngine = (taskName: string, patch: TaskEngineUpdatePatch) =>
+  apiFetch<{ config: TaskEngineConfig }>(`/api/system/task-engines/${encodeURIComponent(taskName)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })
+
+export const testTaskEngine = (taskName: string, input: string) =>
+  apiFetch<TaskEngineTestResult | TaskEngineTestError>(
+    `/api/system/task-engines/${encodeURIComponent(taskName)}/test`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ input }),
+    },
+  )
+
+export const getTaskEngineAudit = (taskName?: string, limit = 50) => {
+  const qs = new URLSearchParams()
+  if (taskName) qs.set('taskName', taskName)
+  qs.set('limit', String(limit))
+  return apiFetch<{ entries: TaskEngineAuditEntry[] }>(
+    `/api/system/task-engines/audit?${qs.toString()}`,
+  )
+}
+
+// ─── LLM Stats (admin only) — S6.4 ───────────────────────
+export interface LlmStatsTotals {
+  totalCalls: number
+  successfulCalls: number
+  cachedCalls: number
+  erroredCalls: number
+  totalCostUsd: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  avgLatencyMs: number
+  cacheHitRate: number
+}
+
+export interface LlmStatsBreakdown {
+  key: string
+  calls: number
+  costUsd: number
+  avgLatencyMs: number
+  cachedRate: number
+}
+
+export interface LlmStats {
+  windowDays: number
+  generatedAt: string
+  totals: LlmStatsTotals
+  byTask: LlmStatsBreakdown[]
+  byProvider: LlmStatsBreakdown[]
+  byModel: LlmStatsBreakdown[]
+  recentErrors: { taskName: string | null; provider: string | null; model: string | null; error: string; createdAt: string }[]
+}
+
+export interface CostCapStatus {
+  spentUsd: number
+  capUsd: number
+  pctUsed: number | null
+  warning: boolean
+  exceeded: boolean
+}
+
+export const getLlmStats = (days = 1) =>
+  apiFetch<LlmStats>(`/api/llm/stats?days=${days}`)
+
+export const getCostCapStatus = () =>
+  apiFetch<CostCapStatus>('/api/llm/cost-cap-status')

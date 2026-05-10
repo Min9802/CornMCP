@@ -2,17 +2,30 @@
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getMemories, deleteMemory } from '@/lib/api'
+import { useConfirm, useToast } from '@/components/ConfirmProvider'
 
 export default function MemoryPage() {
   const { data, mutate } = useSWR('memories', () => getMemories(), { refreshInterval: 15000 })
+  const confirm = useConfirm()
+  const toast = useToast()
 
   async function handleDelete(id: string) {
-    if (!confirm('Delete this memory preview? Vector entry in MCP local store stays until full sync.')) return
+    const ok = await confirm({
+      title: 'Delete memory preview',
+      message: 'Delete this memory preview? Vector entry in MCP local store stays until full sync.',
+      variant: 'danger',
+      confirmLabel: 'Delete',
+    })
+    if (!ok) return
     try {
       await deleteMemory(id)
       mutate()
+      toast({ kind: 'success', message: 'Memory preview deleted' })
     } catch (err) {
-      alert(`Delete failed: ${err instanceof Error ? err.message : err}`)
+      toast({
+        kind: 'error',
+        message: `Delete failed: ${err instanceof Error ? err.message : err}`,
+      })
     }
   }
 

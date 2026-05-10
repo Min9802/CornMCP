@@ -4,11 +4,14 @@ import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getApiKeys, createApiKey, deleteApiKey } from '@/lib/api'
 import { formatLocalDate } from '@/lib/date'
+import { useConfirm, useToast } from '@/components/ConfirmProvider'
 
 export default function KeysPage() {
   const { data, mutate } = useSWR('keys', getApiKeys, { refreshInterval: 30000 })
   const [name, setName] = useState('')
   const [newKey, setNewKey] = useState<string | null>(null)
+  const confirm = useConfirm()
+  const toast = useToast()
 
   const handleCreate = async () => {
     if (!name.trim()) return
@@ -19,9 +22,20 @@ export default function KeysPage() {
   }
 
   const handleDelete = async (id: string) => {
-    if (!confirm('Delete this API key?')) return
-    await deleteApiKey(id)
-    mutate()
+    const ok = await confirm({
+      title: 'Delete API key',
+      message: 'Delete this API key? Agents using it will lose access immediately.',
+      variant: 'danger',
+      confirmLabel: 'Delete',
+    })
+    if (!ok) return
+    try {
+      await deleteApiKey(id)
+      mutate()
+      toast({ kind: 'success', message: 'API key deleted' })
+    } catch (e: any) {
+      toast({ kind: 'error', message: e?.message?.replace(/^API \d+: /, '') || 'Delete failed' })
+    }
   }
 
   return (

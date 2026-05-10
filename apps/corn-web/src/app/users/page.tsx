@@ -6,6 +6,7 @@ import useSWR from 'swr'
 import { getUsers, createUser, updateUser, deleteUser, type UserRecord } from '@/lib/api'
 import { getMe, type AuthUser } from '@/lib/auth'
 import { formatLocalDate } from '@/lib/date'
+import { useConfirm, useToast } from '@/components/ConfirmProvider'
 
 function initials(name: string) {
   return name.split(' ').map((n) => n[0]).join('').toUpperCase().slice(0, 2)
@@ -38,6 +39,8 @@ const emptyForm: UserFormState = { name: '', email: '', password: '', role: 'use
 export default function UsersPage() {
   const { data, mutate, isLoading } = useSWR('users', getUsers)
   const { data: me } = useSWR('me', getMe)
+  const confirm = useConfirm()
+  const toast = useToast()
 
   const [showModal, setShowModal] = useState(false)
   const [editId, setEditId] = useState<string | null>(null)
@@ -88,12 +91,19 @@ export default function UsersPage() {
 
   const handleDelete = async (u: UserRecord) => {
     if (u.id === me?.id) return
-    if (!confirm(`Delete user "${u.name}"? This cannot be undone.`)) return
+    const ok = await confirm({
+      title: 'Delete user',
+      message: `Delete user "${u.name}"?\n\nThis cannot be undone. Their sessions, memories, and audit history remain but become orphaned.`,
+      variant: 'danger',
+      confirmLabel: 'Delete user',
+    })
+    if (!ok) return
     try {
       await deleteUser(u.id)
       mutate()
+      toast({ kind: 'success', message: `Deleted user "${u.name}"` })
     } catch (e: any) {
-      alert(e.message?.replace(/^API \d+: /, '') || 'Delete failed')
+      toast({ kind: 'error', message: e?.message?.replace(/^API \d+: /, '') || 'Delete failed' })
     }
   }
 
