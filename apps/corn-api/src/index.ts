@@ -21,7 +21,9 @@ import { systemRouter } from './routes/system.js'
 import { indexingRouter } from './routes/indexing.js'
 import { authRouter } from './routes/auth.js'
 import { usersRouter } from './routes/users.js'
+import { llmRouter, llmAdminRouter } from './routes/llm.js'
 import { startSessionLifecycleJob } from './services/session-lifecycle.js'
+import { seedDefaultTaskEngines } from './services/task-engines.js'
 
 const app = new Hono()
 const logger = createLogger('corn-api')
@@ -90,6 +92,8 @@ app.route('/api/webhooks', webhooksRouter)
 app.route('/api/intel', intelRouter)
 app.route('/api/system', systemRouter)
 app.route('/api/indexing', indexingRouter)
+app.route('/api/llm', llmRouter)
+app.route('/api/llm', llmAdminRouter)
 
 // ─── Root ───────────────────────────────────────────────
 app.get('/', (c) => {
@@ -120,6 +124,18 @@ async function start() {
   // Initialize database before serving
   await getDb()
   logger.info('Database ready')
+
+  // ── Task engine seed (S5.1) ────────────────────────────
+  // Idempotent — only inserts rows that don't exist. Schema migration
+  // 0015 already seeded a fresh DB; this catches the path where the
+  // schema mirror in `schema.sql` ran (DDL only, no data) ahead of the
+  // migration on a brand-new file.
+  try {
+    const { inserted } = await seedDefaultTaskEngines()
+    if (inserted.length) logger.info(`Task engines seeded: ${inserted.join(', ')}`)
+  } catch (err) {
+    logger.error('Failed to seed task engines:', err)
+  }
 
   // ── Session auto-close sweep ────────────────────────────
   // Sessions stuck in 'active' (e.g. agent crashed before corn_session_end)

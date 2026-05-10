@@ -1,16 +1,22 @@
 import nodemailer from 'nodemailer'
 import { createLogger } from '@corn/shared-utils'
+import { getSetting } from './settings.js'
 
 const logger = createLogger('mailer')
 
-function createTransport() {
-  const host = process.env['MAIL_HOST']
-  const port = Number(process.env['MAIL_PORT'] || 587)
-  const user = process.env['MAIL_USERNAME']
-  const pass = process.env['MAIL_PASSWORD']
+// S2.3 — every config knob below now goes through `getSetting()` so admin
+// edits in the dashboard take effect on the next call (TTL-bounded, no
+// process restart). The env-var names are kept as `fallbackEnv` so an
+// unconfigured fresh deploy still works against legacy `.env`.
+async function createTransport(): Promise<nodemailer.Transporter | null> {
+  const host = await getSetting('mail.host', 'MAIL_HOST')
+  const portStr = (await getSetting('mail.port', 'MAIL_PORT')) ?? '587'
+  const port = Number(portStr) || 587
+  const user = await getSetting('mail.username', 'MAIL_USERNAME')
+  const pass = await getSetting('mail.password', 'MAIL_PASSWORD')
 
   if (!host || !user || !pass) {
-    logger.warn('MAIL_* env vars not configured — emails will be logged to console')
+    logger.warn('mail.* settings not configured — emails will be logged to console')
     return null
   }
 
@@ -22,17 +28,18 @@ function createTransport() {
   })
 }
 
-let transporter: nodemailer.Transporter | null = null
-
-function getTransporter() {
-  if (!transporter) transporter = createTransport()
-  return transporter
-}
-
+// Transporter recreation policy: do NOT cache at module scope. Each send
+// rebuilds the transport via the (TTL-cached) settings layer, so any admin
+// edit takes effect on the next email without a per-mailer cache invalidation
+// hook. This is fine for OTP-frequency traffic; high-volume mail would want
+// a setting-version-keyed cache here.
 export async function sendOtpEmail(to: string, otp: string): Promise<boolean> {
-  const appName = process.env['APP_NAME'] || 'CornMCP'
-  const fromAddr = process.env['MAIL_FROM_ADDRESS'] || process.env['MAIL_USERNAME'] || 'noreply@cornmcp.com'
-  const fromName = (process.env['MAIL_FROM_NAME'] || appName).replace('${APP_NAME}', appName)
+  const appName = (await getSetting('mail.app_name', 'APP_NAME')) || 'CornMCP'
+  const fromAddrSetting = await getSetting('mail.from_address', 'MAIL_FROM_ADDRESS')
+  const userSetting = await getSetting('mail.username', 'MAIL_USERNAME')
+  const fromAddr = fromAddrSetting || userSetting || 'noreply@cornmcp.com'
+  const fromNameRaw = (await getSetting('mail.from_name', 'MAIL_FROM_NAME')) || appName
+  const fromName = fromNameRaw.replace('${APP_NAME}', appName)
 
   const html = `
 <!DOCTYPE html>
@@ -59,7 +66,7 @@ export async function sendOtpEmail(to: string, otp: string): Promise<boolean> {
 </body>
 </html>`
 
-  const transport = getTransporter()
+  const transport = await createTransport()
 
   if (!transport) {
     logger.info(`[DEV] OTP for ${to}: ${otp}`)

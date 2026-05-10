@@ -116,12 +116,104 @@ CREATE TABLE IF NOT EXISTS provider_accounts (
     auth_type TEXT DEFAULT 'api_key',
     api_base TEXT NOT NULL,
     api_key TEXT,
+    api_key_encrypted INTEGER DEFAULT 0,
     status TEXT DEFAULT 'enabled',
     capabilities TEXT DEFAULT '["chat"]',
     models TEXT DEFAULT '[]',
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
 );
+
+-- ── System Settings (S2) ───────────────────────────────
+CREATE TABLE IF NOT EXISTS system_settings (
+    key           TEXT PRIMARY KEY,
+    value         TEXT,
+    is_secret     INTEGER NOT NULL DEFAULT 0,
+    category      TEXT NOT NULL DEFAULT 'general',
+    description   TEXT,
+    default_value TEXT,
+    updated_by    TEXT,
+    updated_at    TEXT DEFAULT (datetime('now')),
+    created_at    TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_system_settings_category ON system_settings(category);
+
+CREATE TABLE IF NOT EXISTS system_settings_audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    key        TEXT NOT NULL,
+    old_value  TEXT,
+    new_value  TEXT,
+    action     TEXT NOT NULL DEFAULT 'set',
+    changed_by TEXT,
+    changed_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_system_settings_audit_key ON system_settings_audit(key, changed_at DESC);
+
+-- ── LLM Gateway logs (S4.5) ───────────────────────────
+-- Mirror of migration 0014 for fresh databases. One row per chatComplete()
+-- call (success OR error). cost_usd is 0 for cached hits + error rows.
+CREATE TABLE IF NOT EXISTS llm_gateway_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_name       TEXT,
+    provider_id     TEXT,
+    provider        TEXT,
+    model           TEXT,
+    input_tokens    INTEGER DEFAULT 0,
+    output_tokens   INTEGER DEFAULT 0,
+    cost_usd        REAL DEFAULT 0,
+    latency_ms      INTEGER DEFAULT 0,
+    cached          INTEGER DEFAULT 0,
+    error           TEXT,
+    user_id         TEXT,
+    session_id      TEXT,
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_llm_gateway_logs_created  ON llm_gateway_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_gateway_logs_task     ON llm_gateway_logs(task_name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_gateway_logs_provider ON llm_gateway_logs(provider_id, created_at DESC);
+
+-- ── Task Engine Config (S5.1) ─────────────────────────
+-- Mirror of migration 0015 for fresh databases. One row per registered
+-- MCP task. Heuristic vs LLM toggle + per-task LLM knobs (provider,
+-- model, prompt template, budget cap). Default seed all heuristic so
+-- the dispatcher behavior is opt-in to LLM per row.
+CREATE TABLE IF NOT EXISTS task_engine_config (
+    task_name              TEXT PRIMARY KEY,
+    engine                 TEXT NOT NULL DEFAULT 'heuristic' CHECK(engine IN ('heuristic','llm')),
+    provider_id            TEXT,
+    model                  TEXT,
+    enabled                INTEGER NOT NULL DEFAULT 1,
+    fallback_to_heuristic  INTEGER NOT NULL DEFAULT 1,
+    prompt_template        TEXT,
+    timeout_ms             INTEGER DEFAULT 30000,
+    max_input_tokens       INTEGER DEFAULT 8000,
+    max_output_tokens      INTEGER DEFAULT 1024,
+    temperature            REAL DEFAULT 0.2,
+    cache_ttl_sec          INTEGER DEFAULT 3600,
+    cost_cap_usd_per_day   REAL DEFAULT 0,
+    description            TEXT,
+    updated_by             TEXT,
+    updated_at             TEXT DEFAULT (datetime('now')),
+    created_at             TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_task_engine_config_engine ON task_engine_config(engine);
+
+-- ── Task Engine audit (S6.1) ──────────────────────────
+-- Mirror of migration 0016 for fresh databases. One row per *field*
+-- changed by `updateTaskEngineConfig()`. Append-only; admin UI renders
+-- diffs from this table.
+CREATE TABLE IF NOT EXISTS task_engine_audit (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_name   TEXT NOT NULL,
+    field       TEXT NOT NULL,
+    old_value   TEXT,
+    new_value   TEXT,
+    action      TEXT NOT NULL DEFAULT 'update' CHECK(action IN ('update','test','reset')),
+    changed_by  TEXT,
+    changed_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_task_engine_audit_task   ON task_engine_audit(task_name, changed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_engine_audit_recent ON task_engine_audit(changed_at DESC);
 
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
