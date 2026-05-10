@@ -101,7 +101,7 @@ services:
     ports:
       - "${MCP_PORT:-8317}:8317"
     volumes:
-      - mcp-data:/app/data
+      - ./mcp-data:/app/data
     environment:
       PORT: 8317
       NODE_ENV: production

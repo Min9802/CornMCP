@@ -18,3 +18,5 @@ PROJECT_CONTEXT.md
 .agent/workflows/rules_handoff_cornhub.md
 plan.*.md
 *_plan.md
+
+infra/*-data
