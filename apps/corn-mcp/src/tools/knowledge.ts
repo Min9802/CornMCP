@@ -33,11 +33,15 @@ async function createEmbedder(): Promise<EmbeddingProvider> {
   const model = process.env['MEM9_EMBEDDING_MODEL'] || 'voyage-code-3'
   const dims = Number(process.env['MEM9_EMBEDDING_DIMS']) || 1024
 
-  // Model rotation: comma-separated fallback list from env, or sensible defaults
+  // Model rotation: comma-separated fallback list from env, or sensible defaults.
+  // ⚠ Fallbacks MUST output the same dimension as MEM9_EMBEDDING_DIMS, otherwise
+  // a 429-driven rotation will produce vectors that mismatch the Qdrant collection
+  // size and surface as "Wrong input: Vector dimension error" on every subsequent
+  // search/store. The defaults below all default to 1024-dim on Voyage AI.
   const fallbackEnv = process.env['MEM9_FALLBACK_MODELS'] || ''
   const fallbackModels = fallbackEnv
     ? fallbackEnv.split(',').map((m) => m.trim()).filter(Boolean)
-    : ['voyage-4-large', 'voyage-4', 'voyage-code-2', 'voyage-4-lite']
+    : ['voyage-3-large', 'voyage-3', 'voyage-3.5']
 
   if (apiKey) {
     try {

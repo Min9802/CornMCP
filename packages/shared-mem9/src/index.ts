@@ -311,7 +311,20 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
       if (res.ok) {
         const data = (await res.json()) as { data: { embedding: number[] }[] }
-        return data.data.map((d) => d.embedding)
+        const vectors = data.data.map((d) => d.embedding)
+        // Fail-fast on dim mismatch: if a rotated/misconfigured model returns
+        // a different dim than what callers (and downstream Qdrant collections)
+        // expect, surface it here with a clear message instead of letting the
+        // raw vectors propagate and failing later inside Qdrant with the
+        // opaque "Wrong input: Vector dimension error" response.
+        const actualDim = vectors[0]?.length ?? 0
+        if (actualDim !== this.dimensions) {
+          throw new Error(
+            `Embedding dim mismatch: model=${model} returned ${actualDim}, expected ${this.dimensions}. ` +
+              `Check MEM9_EMBEDDING_MODEL/MEM9_EMBEDDING_DIMS and MEM9_FALLBACK_MODELS — every fallback model must output the same dimension as the primary.`,
+          )
+        }
+        return vectors
       }
 
       const text = await res.text()
