@@ -2,6 +2,8 @@
 
 import { Suspense, useState, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
+import { getOrganizations } from '@/lib/api'
+import { useToast } from '@/components/ConfirmProvider'
 import styles from './page.module.css'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'
@@ -9,6 +11,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'
 function SetPasswordForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
+  const toast = useToast()
   const isNewGoogle = searchParams.get('new_google') === '1'
 
   const [password, setPassword] = useState('')
@@ -47,6 +50,24 @@ function SetPasswordForm() {
         setError(data.error || 'Failed to set password')
         return
       }
+
+      // New Google users (and anyone landing here without an org yet) should
+      // be nudged into creating an organization before entering the dashboard.
+      try {
+        const orgs = await getOrganizations()
+        if (!orgs.organizations || orgs.organizations.length === 0) {
+          toast({
+            kind: 'warning',
+            message: 'You don\u2019t have any organization yet. Please create one to get started.',
+          })
+          router.push('/orgs')
+          router.refresh()
+          return
+        }
+      } catch {
+        // Non-fatal: fall through to the normal redirect if the org lookup fails.
+      }
+
       router.push('/')
       router.refresh()
     } catch {
@@ -125,7 +146,23 @@ function SetPasswordForm() {
               <button
                 className={styles.btnSkip}
                 type="button"
-                onClick={() => router.push('/')}
+                onClick={async () => {
+                  try {
+                    const orgs = await getOrganizations()
+                    if (!orgs.organizations || orgs.organizations.length === 0) {
+                      toast({
+                        kind: 'warning',
+                        message: 'You don\u2019t have any organization yet. Please create one to get started.',
+                      })
+                      router.push('/orgs')
+                      router.refresh()
+                      return
+                    }
+                  } catch {
+                    // ignore — fall through to the dashboard
+                  }
+                  router.push('/')
+                }}
               >
                 Skip for now
               </button>

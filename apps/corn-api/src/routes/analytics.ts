@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { QueryLog } from '../db/mongoose/index.js'
+import { ApiKey, Organization, Project, QueryLog } from '../db/mongoose/index.js'
 import { anyAuthMiddleware, getAuthCtx } from '../middleware/auth.js'
 
 export const analyticsRouter = new Hono()
@@ -8,22 +8,58 @@ analyticsRouter.use('*', anyAuthMiddleware)
 
 // ─── Tool analytics ─────────────────────────────────────
 analyticsRouter.get('/tool-analytics', async (c) => {
-  const { user, keyIds } = getAuthCtx(c)
+  const { user, keyIds, projectIds } = getAuthCtx(c)
   const days = Number(c.req.query('days') || '7')
   const agentId = c.req.query('agentId')
   const projectId = c.req.query('projectId')
+  // Admin opt-in to the cross-tenant view. The default — even for admins —
+  // is to scope to the caller's own keys so the dashboard answers
+  // "what is *my* usage?" by default.
+  const allMode = c.req.query('all') === '1'
+  if (allMode && user.role !== 'admin') {
+    return c.json({ error: 'Access denied' }, 403)
+  }
+
+  // For non-admins the middleware already loads keyIds/projectIds = own.
+  // For admins those are *all* keys/projects (system-wide), so we must
+  // fetch their own scope explicitly to power the default per-user view.
+  let ownKeyIds: string[] = keyIds
+  let ownProjectIds: string[] = projectIds
+  if (user.role === 'admin') {
+    const [ownKeys, ownOrgs] = await Promise.all([
+      ApiKey.find({ user_id: user.id }, { _id: 1 }).lean(),
+      Organization.find({ user_id: user.id }, { _id: 1 }).lean(),
+    ])
+    ownKeyIds = ownKeys.map((k) => k._id)
+    const ownOrgIds = ownOrgs.map((o) => o._id)
+    const ownProjects = await Project.find({ org_id: { $in: ownOrgIds } }, { _id: 1 }).lean()
+    ownProjectIds = ownProjects.map((p) => p._id)
+  }
 
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
   const match: Record<string, unknown> = { created_at: { $gte: since } }
 
-  // Scope to user's keys unless admin. If a non-admin has zero keys we must
-  // force the result set to empty — falling through with no filter would leak
-  // every other user's query logs (the agent_id column has no user_id FK).
-  if (user.role !== 'admin') {
-    match.agent_id = keyIds.length === 0 ? { $in: [] as string[] } : { $in: keyIds }
+  // Default scope = caller's own keys. Empty owned-key set must produce zero
+  // rows (otherwise a missing filter would leak every tenant's logs).
+  if (!allMode) {
+    match.agent_id = ownKeyIds.length === 0 ? { $in: [] as string[] } : { $in: ownKeyIds }
   }
-  if (agentId) match.agent_id = agentId
-  if (projectId) match.project_id = projectId
+
+  // Optional explicit filters. Outside admin all-mode the caller MUST own
+  // the agent_id / project_id; otherwise the query param trivially bypasses
+  // the per-user filter set above.
+  if (agentId) {
+    if (!allMode && !ownKeyIds.includes(agentId)) {
+      return c.json({ error: 'Access denied' }, 403)
+    }
+    match.agent_id = agentId
+  }
+  if (projectId) {
+    if (!allMode && !ownProjectIds.includes(projectId)) {
+      return c.json({ error: 'Access denied' }, 403)
+    }
+    match.project_id = projectId
+  }
 
   // The summary, per-tool, per-agent, and trend pipelines all share the same
   // time + ownership $match prefix; only the $group key changes.

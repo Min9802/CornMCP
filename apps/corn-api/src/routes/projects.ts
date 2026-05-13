@@ -4,7 +4,7 @@
 
 import { Hono, type Context } from 'hono'
 import { generateId } from '@corn/shared-utils'
-import { Project, Organization } from '../db/mongoose/index.js'
+import { Project, Organization, User } from '../db/mongoose/index.js'
 import { jwtAuthMiddleware, getAuthCtx } from '../middleware/auth.js'
 
 export const projectsRouter = new Hono()
@@ -153,21 +153,53 @@ orgsRouter.get('/', async (c) => {
   return c.json({ organizations })
 })
 
+// Resolve owner user_id for a new/updated organization.
+// Admin can pass an explicit `userId` to assign ownership to any active user.
+// Non-admin (or admin omitting the field) defaults to the current user.
+// Returns either { ok: true, userId } or { ok: false, response }.
+async function resolveOrgOwner(
+  c: Context,
+  bodyUserId: unknown,
+  fallbackUserId: string,
+): Promise<{ ok: true; userId: string } | { ok: false; response: Response }> {
+  const { user } = getAuthCtx(c)
+  const raw = typeof bodyUserId === 'string' ? bodyUserId.trim() : ''
+
+  // Non-admin can never reassign — always self.
+  if (user.role !== 'admin') return { ok: true, userId: fallbackUserId }
+
+  // Empty / not provided → default to fallback (current admin on create,
+  // existing owner on update).
+  if (!raw) return { ok: true, userId: fallbackUserId }
+
+  const target = await User.findById(raw, { _id: 1, is_active: 1 }).lean()
+  if (!target) {
+    return { ok: false, response: c.json({ error: 'Assigned user not found' }, 400) }
+  }
+  if (target.is_active === false) {
+    return { ok: false, response: c.json({ error: 'Assigned user is inactive' }, 400) }
+  }
+  return { ok: true, userId: raw }
+}
+
 orgsRouter.post('/', async (c) => {
   const body = await c.req.json()
   const { user } = getAuthCtx(c)
   const id = generateId('org')
   const slug = (body.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
 
+  const owner = await resolveOrgOwner(c, body.userId, user.id)
+  if (!owner.ok) return owner.response
+
   await Organization.create({
     _id: id,
     name: body.name,
     slug,
     description: body.description ?? null,
-    user_id: user.id,
+    user_id: owner.userId,
   } as Parameters<typeof Organization.create>[0])
 
-  return c.json({ ok: true, id })
+  return c.json({ ok: true, id, userId: owner.userId })
 })
 
 orgsRouter.put('/:id', async (c) => {
@@ -175,20 +207,33 @@ orgsRouter.put('/:id', async (c) => {
   const body = await c.req.json()
   const { user } = getAuthCtx(c)
 
-  // Check ownership
-  if (user.role !== 'admin') {
-    const org = await Organization.findById(id, { user_id: 1 }).lean()
-    if (!org || org.user_id !== user.id) {
-      return c.json({ error: 'Access denied' }, 403)
-    }
+  const existing = await Organization.findById(id, { user_id: 1 }).lean()
+  if (!existing) return c.json({ error: 'Organization not found' }, 404)
+
+  // Non-admin must own the org.
+  if (user.role !== 'admin' && existing.user_id !== user.id) {
+    return c.json({ error: 'Access denied' }, 403)
   }
 
   const slug = (body.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
-  await Organization.updateOne(
-    { _id: id },
-    { $set: { name: body.name, slug, description: body.description ?? null } },
-  )
+  const update: Record<string, unknown> = {
+    name: body.name,
+    slug,
+    description: body.description ?? null,
+  }
 
+  // Owner reassignment — only honored when the client sends the field
+  // explicitly. Admin can set any active user; admin sending empty string
+  // ("yourself" option in the UI) resets ownership to themselves. Non-admin
+  // requests silently keep the existing owner.
+  if (body.userId !== undefined) {
+    const fallback = user.role === 'admin' ? user.id : existing.user_id ?? user.id
+    const owner = await resolveOrgOwner(c, body.userId, fallback)
+    if (!owner.ok) return owner.response
+    update.user_id = owner.userId
+  }
+
+  await Organization.updateOne({ _id: id }, { $set: update })
   return c.json({ ok: true })
 })
 

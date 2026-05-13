@@ -1,10 +1,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import type { McpEnv } from '@corn/shared-types'
-import { Mem9Service, OpenAIEmbeddingProvider, LocalHashEmbeddingProvider } from '@corn/shared-mem9'
-import type { EmbeddingProvider } from '@corn/shared-mem9'
 import { generateId } from '@corn/shared-utils'
 import { runTask } from '../services/task-dispatcher.js'
+import { getMem9 } from '../services/embedder.js'
 import {
   AUTO_TAGS_TASK_NAME,
   registerAutoTagsTask,
@@ -24,62 +23,6 @@ function apiHeaders(env: McpEnv): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' }
   if (env.DASHBOARD_API_KEY) h['X-API-Key'] = env.DASHBOARD_API_KEY
   return h
-}
-
-let mem9: Mem9Service | null = null
-let usingFallback = false
-
-async function createEmbedder(): Promise<EmbeddingProvider> {
-  const apiKey = process.env['OPENAI_API_KEY'] || ''
-  const apiBase = process.env['OPENAI_API_BASE'] || 'https://api.voyageai.com/v1'
-  const model = process.env['MEM9_EMBEDDING_MODEL'] || 'voyage-code-3'
-  const dims = Number(process.env['MEM9_EMBEDDING_DIMS']) || 1024
-
-  // Model rotation: comma-separated fallback list from env, or sensible defaults.
-  // ⚠ Fallbacks MUST output the same dimension as MEM9_EMBEDDING_DIMS, otherwise
-  // a 429-driven rotation will produce vectors that mismatch the Qdrant collection
-  // size and surface as "Wrong input: Vector dimension error" on every subsequent
-  // search/store. The defaults below all default to 1024-dim on Voyage AI.
-  const fallbackEnv = process.env['MEM9_FALLBACK_MODELS'] || ''
-  const fallbackModels = fallbackEnv
-    ? fallbackEnv.split(',').map((m) => m.trim()).filter(Boolean)
-    : ['voyage-3-large', 'voyage-3', 'voyage-3.5']
-
-  if (apiKey) {
-    // Test the key before committing to it
-    try {
-      const testEmbedder = new OpenAIEmbeddingProvider(apiKey, apiBase, model, dims, fallbackModels)
-      await testEmbedder.embed(['test'])
-      console.error(`[corn-mcp] Embedding API key validated ✓ (primary: ${model}, fallbacks: ${fallbackModels.join(', ')})`)
-      return testEmbedder
-    } catch (err) {
-      console.error(`[corn-mcp] Embedding API key invalid, falling back to local hash embeddings: ${err instanceof Error ? err.message : err}`)
-    }
-  } else {
-    console.error('[corn-mcp] No OPENAI_API_KEY set, using local hash embeddings')
-  }
-
-  usingFallback = true
-  return new LocalHashEmbeddingProvider(256)
-}
-
-let initPromise: Promise<Mem9Service> | null = null
-
-function getMem9(env: McpEnv): Promise<Mem9Service> {
-  if (mem9) return Promise.resolve(mem9)
-  if (!initPromise) {
-    initPromise = createEmbedder().then(async (embedder) => {
-      const qdrantUrl = env.QDRANT_URL || process.env['QDRANT_URL'] || 'http://localhost:6333'
-      const svc = new Mem9Service(qdrantUrl, embedder)
-      // ensureCollection is idempotent (probes GET /collections/:name first),
-      // so this is safe to call on every cold start. Required because Qdrant
-      // returns 404 for first-time upsert without an existing collection.
-      await svc.init()
-      mem9 = svc
-      return svc
-    })
-  }
-  return initPromise
 }
 
 export function registerMemoryTools(server: McpServer, env: McpEnv) {

@@ -6,6 +6,91 @@ import { createHash } from 'crypto'
 
 const logger = createLogger('mem9')
 
+// ─── Provider metadata + collection naming ──────────────
+//
+// We isolate vector data per (provider, model) tuple so that swapping the
+// embedding backend (e.g. Voyage → LM Studio bge-m3) doesn't pollute the
+// existing collection with semantically-incompatible vectors. Two vectors
+// of the same dimension from different models live in different latent
+// spaces — cosine similarity between them is noise. Per-provider
+// collections preserve the old data verbatim and let the admin run an
+// explicit re-embed ("sync") when they want a unified searchable corpus.
+//
+// Naming scheme: `<base>__<provider_slug>__<model_slug>`
+//   corn_memories__voyage__voyage_code_3
+//   corn_memories__lmstudio__text_embedding_bge_m3
+//   corn_memories__openai__text_embedding_3_small
+// Double-underscore separator avoids clashing with model names that
+// already contain single underscores. Slugs are normalised lowercase
+// alphanumeric so Qdrant accepts them (Qdrant collection names allow
+// `[a-zA-Z0-9_-]`, max 255 chars; we cap each slug at 64 chars to leave
+// headroom).
+
+export type EmbeddingProviderType =
+  | 'voyage'
+  | 'openai'
+  | 'anthropic'
+  | 'lmstudio'
+  | 'ollama'
+  | 'local'
+  | 'custom'
+
+export interface EmbeddingProviderInfo {
+  /** High-level provider family — used for the UI badge + collection slug. */
+  provider: EmbeddingProviderType
+  /** Active model identifier as the provider expects it on the wire. */
+  model: string
+  /** Vector dimensionality — matches Qdrant collection's `vectors.size`. */
+  dimensions: number
+}
+
+/**
+ * Lower-case alpha-numeric slug. Non-alphanumeric runs collapse to a
+ * single `_`. Leading/trailing `_` are trimmed. Capped at 64 chars to
+ * keep collection names well under Qdrant's 255-char limit even when
+ * combined with base + provider.
+ */
+export function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64) || 'unknown'
+}
+
+/**
+ * Best-effort heuristic: derive provider family from API base URL. Used
+ * when callers don't explicitly thread a provider type through (e.g. the
+ * env-fallback path in corn-mcp). Falls back to 'custom' for unrecognised
+ * hosts so legitimate self-hosted deployments aren't silently mis-tagged
+ * as something else.
+ */
+export function detectProviderType(apiBase: string): EmbeddingProviderType {
+  const lower = apiBase.toLowerCase()
+  if (lower.includes('voyageai.com')) return 'voyage'
+  if (lower.includes('api.openai.com')) return 'openai'
+  if (lower.includes('api.anthropic.com')) return 'anthropic'
+  // Local providers: match by typical port. LM Studio defaults to 1234,
+  // Ollama to 11434. Both expose OpenAI-compat /v1/embeddings.
+  if (/:1234(\b|\/)/.test(lower)) return 'lmstudio'
+  if (/:11434(\b|\/)/.test(lower)) return 'ollama'
+  return 'custom'
+}
+
+/**
+ * Compose a Qdrant collection name from a base + provider info. The base
+ * is typically `<prefix>_memories` or `<prefix>_knowledge`; the result
+ * name is stable across restarts as long as provider + model don't move.
+ */
+export function embeddingCollectionName(
+  base: string,
+  info: { provider: string; model: string },
+): string {
+  const providerSlug = slugify(info.provider)
+  const modelSlug = slugify(info.model)
+  return `${base}__${providerSlug}__${modelSlug}`
+}
+
 // ─── Qdrant Client (kept for backward compat) ──────────
 
 interface QdrantPoint {
@@ -76,6 +161,118 @@ export class QdrantClient {
     } catch (err) {
       logger.error(`Failed to ensure collection ${name}:`, err)
       throw err
+    }
+  }
+
+  /**
+   * Probe a collection without creating it. Returns metadata (vector
+   * size + point count) when present, null on 404. Other errors throw.
+   * Used by the legacy-collection migration path so we can decide
+   * whether to clone, skip, or warn before touching anything.
+   */
+  async getCollectionInfo(name: string): Promise<{
+    name: string
+    vectorSize: number
+    pointsCount: number
+  } | null> {
+    const res = await fetch(`${this.baseUrl}/collections/${name}`, {
+      signal: AbortSignal.timeout(5000),
+    })
+    if (res.status === 404) return null
+    if (!res.ok) {
+      throw new Error(`Qdrant getCollection ${name} failed: ${await res.text()}`)
+    }
+    const data = (await res.json()) as {
+      result?: {
+        config?: { params?: { vectors?: { size?: number } } }
+        points_count?: number
+      }
+    }
+    const vectorSize = data.result?.config?.params?.vectors?.size ?? 0
+    const pointsCount = data.result?.points_count ?? 0
+    return { name, vectorSize, pointsCount }
+  }
+
+  /**
+   * Page through every point in a collection. Yields batches as soon as
+   * each network call returns so memory stays bounded for large stores.
+   * Used by the inline legacy-collection migration to clone raw vectors
+   * without re-embedding.
+   */
+  async *scrollAll(
+    collection: string,
+    options: { batchSize?: number; withVectors?: boolean; withPayload?: boolean } = {},
+  ): AsyncGenerator<
+    Array<{ id: string | number; vector?: number[]; payload?: Record<string, unknown> }>,
+    void,
+    void
+  > {
+    const batchSize = options.batchSize ?? 250
+    const withVectors = options.withVectors ?? true
+    const withPayload = options.withPayload ?? true
+    let offset: string | number | undefined = undefined
+
+    while (true) {
+      const body: Record<string, unknown> = {
+        limit: batchSize,
+        with_payload: withPayload,
+        with_vector: withVectors,
+      }
+      if (offset !== undefined) body.offset = offset
+
+      const res = await fetch(`${this.baseUrl}/collections/${collection}/points/scroll`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      })
+      if (!res.ok) {
+        throw new Error(`Qdrant scroll ${collection} failed: ${await res.text()}`)
+      }
+      const data = (await res.json()) as {
+        result?: {
+          points?: Array<{
+            id: string | number
+            vector?: number[] | { [k: string]: number[] }
+            payload?: Record<string, unknown>
+          }>
+          next_page_offset?: string | number | null
+        }
+      }
+      const points = data.result?.points ?? []
+      if (points.length === 0) return
+
+      yield points.map((p) => ({
+        id: p.id,
+        vector: Array.isArray(p.vector) ? p.vector : undefined,
+        payload: p.payload,
+      }))
+
+      const next = data.result?.next_page_offset
+      if (next === null || next === undefined) return
+      offset = next
+    }
+  }
+
+  /**
+   * Upsert points using their existing on-wire ids verbatim — no
+   * `toQdrantPointId` hash, no `_id_raw` rewrite. Required for the
+   * legacy → suffixed migration path where the source already holds
+   * UUIDs that need to land in the target unchanged so callers' raw
+   * ids round-trip the same way.
+   */
+  async rawUpsert(
+    collection: string,
+    points: Array<{ id: string | number; vector: number[]; payload?: Record<string, unknown> }>,
+  ): Promise<void> {
+    if (points.length === 0) return
+    const res = await fetch(`${this.baseUrl}/collections/${collection}/points`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ points }),
+    })
+    if (!res.ok) {
+      throw new Error(`Qdrant rawUpsert failed: ${await res.text()}`)
     }
   }
 
@@ -157,6 +354,14 @@ export class QdrantClient {
 export interface EmbeddingProvider {
   embed(texts: string[]): Promise<number[][]>
   dimensions: number
+  /**
+   * Self-describe so callers (Mem9Service, /health probe, sync helper)
+   * can route data into per-provider collections without re-deriving
+   * the active model from URL/env. Stable contract: provider family is
+   * one of the slugged enum members; `model` is the provider's exact
+   * model id (used as part of the collection slug).
+   */
+  getProviderInfo(): EmbeddingProviderInfo
 }
 
 /**
@@ -174,6 +379,10 @@ export class LocalHashEmbeddingProvider implements EmbeddingProvider {
 
   async embed(texts: string[]): Promise<number[][]> {
     return texts.map((text) => this._hashEmbed(text))
+  }
+
+  getProviderInfo(): EmbeddingProviderInfo {
+    return { provider: 'local', model: 'hash', dimensions: this.dimensions }
   }
 
   private _hashEmbed(text: string): number[] {
@@ -230,6 +439,12 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private apiBase: string
   private models: string[]
   private currentModelIndex: number
+  /** Primary model — never moves once set, so collection naming is stable
+   * even after a 429 rotation lifts `currentModelIndex`. */
+  private primaryModel: string
+  /** Provider family detected from apiBase at construction. Cached so
+   * `getProviderInfo()` is a hot pure read. */
+  private providerType: EmbeddingProviderType
 
   /** Current active model name */
   get model(): string {
@@ -247,10 +462,22 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.apiBase = apiBase.replace(/\/$/, '')
     this.dimensions = dimensions
     this.currentModelIndex = 0
+    this.primaryModel = model
+    this.providerType = detectProviderType(this.apiBase)
 
     // Build model rotation list: primary model first, then fallbacks (deduped)
     const allModels = [model, ...(fallbackModels || [])]
     this.models = [...new Set(allModels)]
+  }
+
+  getProviderInfo(): EmbeddingProviderInfo {
+    // Use the primary model — not `currentModelIndex` — so a transient
+    // 429 rotation doesn't shuffle data into a different collection.
+    return {
+      provider: this.providerType,
+      model: this.primaryModel,
+      dimensions: this.dimensions,
+    }
   }
 
   async embed(texts: string[]): Promise<number[][]> {
@@ -500,19 +727,109 @@ export class SQLiteVectorStore {
 
 // ─── Mem9 Service (original — uses Qdrant) ──────────────
 
+export interface Mem9Options {
+  /** Base name shared by memory + knowledge collections. Defaults to `corn`,
+   * yielding `corn_memories` / `corn_knowledge` as legacy bases — the
+   * dynamic suffix `__<provider>__<model>` is appended at init() time. */
+  collectionPrefix?: string
+}
+
 export class Mem9Service {
   private qdrant: QdrantClient
   private embedder: EmbeddingProvider
+  private collectionPrefix: string
+  /** Resolved during init(): `<prefix>_memories__<provider>__<model>`. */
+  private memoryCollection!: string
+  /** Resolved during init(): `<prefix>_knowledge__<provider>__<model>`. */
+  private knowledgeCollection!: string
 
-  constructor(qdrantUrl: string, embedder: EmbeddingProvider) {
+  constructor(qdrantUrl: string, embedder: EmbeddingProvider, options: Mem9Options = {}) {
     this.qdrant = new QdrantClient(qdrantUrl)
     this.embedder = embedder
+    this.collectionPrefix = options.collectionPrefix ?? 'corn'
+  }
+
+  /** Resolved collection names — useful for /health, sync helpers, audit. */
+  getCollectionNames(): { memories: string; knowledge: string } {
+    return { memories: this.memoryCollection, knowledge: this.knowledgeCollection }
   }
 
   async init(): Promise<void> {
-    await this.qdrant.ensureCollection('corn_memories', this.embedder.dimensions)
-    await this.qdrant.ensureCollection('corn_knowledge', this.embedder.dimensions)
-    logger.info('Mem9 collections initialized')
+    const info = this.embedder.getProviderInfo()
+    const memBase = `${this.collectionPrefix}_memories`
+    const kbBase = `${this.collectionPrefix}_knowledge`
+    this.memoryCollection = embeddingCollectionName(memBase, info)
+    this.knowledgeCollection = embeddingCollectionName(kbBase, info)
+
+    // Inline legacy migration: if we still have unsuffixed `corn_memories`
+    // / `corn_knowledge` collections from before this refactor, clone
+    // their points into the suffixed equivalent for the *current* embedder
+    // when dim matches (raw copy, no re-embed). Mismatched dim → leave
+    // legacy untouched + log a warning so the admin can run an explicit
+    // sync (re-embed) later. Idempotent: skips when suffixed already
+    // exists.
+    await this._migrateLegacyIfNeeded(memBase, this.memoryCollection, info.dimensions)
+    await this._migrateLegacyIfNeeded(kbBase, this.knowledgeCollection, info.dimensions)
+
+    await this.qdrant.ensureCollection(this.memoryCollection, info.dimensions)
+    await this.qdrant.ensureCollection(this.knowledgeCollection, info.dimensions)
+    logger.info(
+      `Mem9 collections initialized: memories=${this.memoryCollection} knowledge=${this.knowledgeCollection} (dim=${info.dimensions})`,
+    )
+  }
+
+  /**
+   * One-shot legacy migration helper. Runs at every init() but is
+   * idempotent (skips when the suffixed target already exists). Clones
+   * raw vectors verbatim — same dim guarantees they're directly
+   * compatible without re-embedding.
+   */
+  private async _migrateLegacyIfNeeded(
+    legacyName: string,
+    suffixedName: string,
+    currentDim: number,
+  ): Promise<void> {
+    const [legacy, suffixed] = await Promise.all([
+      this.qdrant.getCollectionInfo(legacyName),
+      this.qdrant.getCollectionInfo(suffixedName),
+    ])
+
+    if (!legacy) return // No legacy collection → fresh install, nothing to migrate.
+    if (suffixed) return // Already migrated previously, idempotent.
+
+    if (legacy.vectorSize !== currentDim) {
+      logger.warn(
+        `Legacy ${legacyName} has dim=${legacy.vectorSize} but current embedder is dim=${currentDim}; ` +
+          `skipping inline migration — use the embedding-sync helper to re-embed when ready. ` +
+          `Legacy data is preserved untouched at ${legacyName}.`,
+      )
+      return
+    }
+
+    logger.info(
+      `Migrating legacy ${legacyName} (${legacy.pointsCount} points, dim=${legacy.vectorSize}) → ${suffixedName} via raw vector clone`,
+    )
+    await this.qdrant.ensureCollection(suffixedName, currentDim)
+
+    let copied = 0
+    for await (const batch of this.qdrant.scrollAll(legacyName, {
+      batchSize: 250,
+      withVectors: true,
+      withPayload: true,
+    })) {
+      const points = batch
+        .filter((p) => Array.isArray(p.vector))
+        .map((p) => ({
+          id: p.id,
+          vector: p.vector!,
+          payload: p.payload ?? {},
+        }))
+      if (points.length > 0) {
+        await this.qdrant.rawUpsert(suffixedName, points)
+        copied += points.length
+      }
+    }
+    logger.info(`Migrated ${copied}/${legacy.pointsCount} points → ${suffixedName}`)
   }
 
   async storeMemory(
@@ -521,7 +838,7 @@ export class Mem9Service {
     metadata: Record<string, unknown>,
   ): Promise<void> {
     const [vector] = await this.embedder.embed([content])
-    await this.qdrant.upsert('corn_memories', [
+    await this.qdrant.upsert(this.memoryCollection, [
       { id, vector, payload: { content, ...metadata, stored_at: new Date().toISOString() } },
     ])
   }
@@ -535,7 +852,7 @@ export class Mem9Service {
     const qdrantFilter = filter
       ? { must: Object.entries(filter).map(([key, value]) => ({ key, match: { value } })) }
       : undefined
-    return this.qdrant.search('corn_memories', vector, limit, qdrantFilter)
+    return this.qdrant.search(this.memoryCollection, vector, limit, qdrantFilter)
   }
 
   async storeKnowledge(
@@ -544,7 +861,7 @@ export class Mem9Service {
     metadata: Record<string, unknown>,
   ): Promise<void> {
     const [vector] = await this.embedder.embed([content])
-    await this.qdrant.upsert('corn_knowledge', [
+    await this.qdrant.upsert(this.knowledgeCollection, [
       { id, vector, payload: { content, ...metadata, stored_at: new Date().toISOString() } },
     ])
   }
@@ -558,7 +875,7 @@ export class Mem9Service {
     const qdrantFilter = filter
       ? { must: Object.entries(filter).map(([key, value]) => ({ key, match: { value } })) }
       : undefined
-    return this.qdrant.search('corn_knowledge', vector, limit, qdrantFilter)
+    return this.qdrant.search(this.knowledgeCollection, vector, limit, qdrantFilter)
   }
 
   async health(): Promise<boolean> {

@@ -4,6 +4,8 @@ import { Suspense, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { login } from '@/lib/auth'
+import { getOrganizations } from '@/lib/api'
+import { useToast } from '@/components/ConfirmProvider'
 import styles from './page.module.css'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'
@@ -11,6 +13,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'
 function LoginForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
+  const toast = useToast()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
@@ -46,6 +49,23 @@ function LoginForm() {
       }
       setError(result.error || 'Login failed')
       return
+    }
+
+    // If the user has no organization yet, force them through onboarding
+    // (create org first) before landing on any feature page.
+    try {
+      const orgs = await getOrganizations()
+      if (!orgs.organizations || orgs.organizations.length === 0) {
+        toast({
+          kind: 'warning',
+          message: 'You don\u2019t have any organization yet. Please create one to get started.',
+        })
+        router.push('/orgs')
+        router.refresh()
+        return
+      }
+    } catch {
+      // Non-fatal: fall through to the normal redirect if the org lookup fails.
     }
 
     const from = searchParams.get('from') || '/'

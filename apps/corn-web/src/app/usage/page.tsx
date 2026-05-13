@@ -1,7 +1,9 @@
 'use client'
+import { useState } from 'react'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import { getToolAnalytics } from '@/lib/api'
+import { getMe } from '@/lib/auth'
 
 function formatBytes(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)} MB`
@@ -10,12 +12,44 @@ function formatBytes(n: number): string {
 }
 
 export default function UsagePage() {
-  const { data } = useSWR('tool-analytics', () => getToolAnalytics(30), { refreshInterval: 15000 })
+  const { data: me } = useSWR('auth-me', getMe, { revalidateOnFocus: false })
+  const isAdmin = me?.role === 'admin'
+  // Default view shows the caller's own usage. Admins can opt-in to a
+  // global cross-tenant view via the toggle below.
+  const [viewAll, setViewAll] = useState(false)
+  const effectiveAll = viewAll && isAdmin
+  const { data } = useSWR(
+    ['tool-analytics', effectiveAll ? 'all' : 'self'],
+    () => getToolAnalytics(30, { all: effectiveAll }),
+    { refreshInterval: 15000 },
+  )
 
   const summary = data?.summary
 
   return (
-    <DashboardLayout title="Usage" subtitle="Tool analytics, call volume, and performance tracking">
+    <DashboardLayout
+      title="Usage"
+      subtitle={`Tool analytics, call volume, and performance tracking — ${effectiveAll ? 'All users (admin)' : 'Your activity'}`}
+    >
+      {isAdmin && (
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'flex-end',
+            marginBottom: 'var(--space-4)',
+          }}
+        >
+          <button
+            type="button"
+            className={`btn btn-sm ${viewAll ? 'btn-primary' : 'btn-secondary'}`}
+            onClick={() => setViewAll((v) => !v)}
+            title={viewAll ? 'Showing all users — click to switch back' : 'Show usage across all users'}
+          >
+            {viewAll ? '🌐 Viewing: All users' : '👤 Viewing: You only'}
+          </button>
+        </div>
+      )}
+
       {/* Top Stats */}
       <div style={{ display: 'flex', gap: 'var(--space-4)', marginBottom: 'var(--space-6)', flexWrap: 'wrap' }}>
         <div className="card" style={{ flex: 1, minWidth: 160, textAlign: 'center' }}>
