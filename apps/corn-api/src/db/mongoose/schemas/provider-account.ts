@@ -16,6 +16,10 @@ const providerAccountSchema = new Schema(
     status: { type: String, default: 'enabled', index: true },
     capabilities: { type: [String], default: ['chat'] },
     models: { type: [String], default: [] },
+    // Embedding vector dimensionality — required when `capabilities` includes
+    // 'embedding' so /api/system/embedding-config can resolve the dim that
+    // matches the Qdrant collection. Null/omitted for chat-only providers.
+    dims: { type: Number, default: null },
     // Added by SQLite migration 0001 — owner of the provider account
     // (null = legacy global account from before tenancy was introduced).
     user_id: { type: String, default: null, index: true },

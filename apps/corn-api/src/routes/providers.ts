@@ -51,6 +51,27 @@ providersRouter.get('/', async (c) => {
   return c.json({ providers: rows.map((r) => sanitizeProvider(r as Record<string, unknown>)) })
 })
 
+// ─── List embedding-capable providers ──────────────────
+// Used by System Settings → Embedding picker so the admin can swap the
+// active embedding provider without re-entering api_base/key/dims.
+// Returns ALL providers (regardless of user_id) because the system
+// setting `embedding.provider_id` is system-wide — the admin must be
+// able to reference any enabled provider in the catalogue.
+providersRouter.get('/embedding-candidates', async (c) => {
+  const { user } = getAuthCtx(c)
+  if (user.role !== 'admin') return c.json({ error: 'Admin role required' }, 403)
+
+  const rows = await ProviderAccount.find(
+    { capabilities: 'embedding', status: 'enabled' },
+    {
+      _id: 1, name: 1, type: 1, api_base: 1, api_key: 1, models: 1, dims: 1,
+      status: 1, capabilities: 1, user_id: 1, created_at: 1,
+    },
+  ).sort({ created_at: -1 }).lean()
+
+  return c.json({ providers: rows.map((r) => sanitizeProvider(r as Record<string, unknown>)) })
+})
+
 // ─── Create provider ──────────────────────
 providersRouter.post('/', async (c) => {
   const body = await c.req.json()
@@ -64,6 +85,23 @@ providersRouter.post('/', async (c) => {
   const models = body.models?.length ? body.models : (preset?.models || [])
 
   if (!apiBase) return c.json({ error: 'api_base is required' }, 400)
+
+  // Normalise capabilities to an array of known tokens; default ['chat']
+  // matches the schema default. Embedding capability requires `dims` so
+  // the resolver in /embedding-config can pick a valid Qdrant size.
+  const capabilities: string[] = Array.isArray(body.capabilities) && body.capabilities.length > 0
+    ? body.capabilities.map((s: unknown) => String(s)).filter(Boolean)
+    : ['chat']
+  const dimsRaw = body.dims
+  const dims: number | null =
+    typeof dimsRaw === 'number' && dimsRaw > 0
+      ? Math.floor(dimsRaw)
+      : typeof dimsRaw === 'string' && /^\d+$/.test(dimsRaw) && Number(dimsRaw) > 0
+        ? Number(dimsRaw)
+        : null
+  if (capabilities.includes('embedding') && dims === null) {
+    return c.json({ error: 'dims (positive integer) is required when capabilities include "embedding"' }, 400)
+  }
 
   // S1.5 — wrap api_key in AES-GCM envelope before write. encrypt() is
   // idempotent (already-encrypted values pass through) and null-safe.
@@ -81,8 +119,9 @@ providersRouter.post('/', async (c) => {
     api_key: storedKey,
     api_key_encrypted: encryptedFlag,
     status: body.status || 'enabled',
-    capabilities: body.capabilities || ['chat'],
+    capabilities,
     models,
+    dims,
     user_id: user.id,
   } as Parameters<typeof ProviderAccount.create>[0])
 
@@ -116,6 +155,29 @@ providersRouter.patch('/:id', async (c) => {
   }
   if (body.models) update['models'] = body.models
   if (body.capabilities) update['capabilities'] = body.capabilities
+  if (body.dims !== undefined) {
+    const dimsRaw = body.dims
+    if (dimsRaw === null || dimsRaw === '') {
+      update['dims'] = null
+    } else if (typeof dimsRaw === 'number' && dimsRaw > 0) {
+      update['dims'] = Math.floor(dimsRaw)
+    } else if (typeof dimsRaw === 'string' && /^\d+$/.test(dimsRaw) && Number(dimsRaw) > 0) {
+      update['dims'] = Number(dimsRaw)
+    } else {
+      return c.json({ error: 'dims must be a positive integer or null' }, 400)
+    }
+  }
+
+  // Cross-field validation: if final capability set contains 'embedding',
+  // dims must be present (either in this PATCH or already on the row).
+  if (Array.isArray(update['capabilities']) && (update['capabilities'] as string[]).includes('embedding')) {
+    const finalDims = update['dims'] !== undefined
+      ? update['dims']
+      : (await ProviderAccount.findById(id, { dims: 1 }).lean())?.dims ?? null
+    if (typeof finalDims !== 'number' || finalDims <= 0) {
+      return c.json({ error: 'dims is required when capabilities include "embedding"' }, 400)
+    }
+  }
 
   if (Object.keys(update).length === 0) {
     return c.json({ ok: true })

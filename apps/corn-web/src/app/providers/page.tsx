@@ -26,6 +26,13 @@ const PRESETS: Record<string, { apiBase: string; keyLabel: string; models: strin
 
 const TYPE_ICONS: Record<string, string> = { openai: '🟢', anthropic: '🟣', copilot: '⭐', 'github-models': '🐙', openrouter: '🔀', ollama: '🦙', custom: '⚙️' }
 
+// Known capability tokens. 'chat' = LLM completion (default); 'embedding' =
+// embedding vector generation (requires `dims`). A provider can carry both.
+const CAPABILITY_OPTIONS = [
+  { value: 'chat', label: '💬 Chat (LLM)', hint: 'For corn_chat / LLM gateway routing' },
+  { value: 'embedding', label: '🔍 Embedding', hint: 'For corn_memory_* / Mem9. Requires Dimensions.' },
+] as const
+
 export default function ProvidersPage() {
   const { data, mutate } = useSWR('providers', getProviders, { refreshInterval: 30000 })
   const confirm = useConfirm()
@@ -37,9 +44,15 @@ export default function ProvidersPage() {
   const [apiBase, setApiBase] = useState(PRESETS.openai.apiBase)
   const [apiKey, setApiKey] = useState('')
   const [modelsInput, setModelsInput] = useState(PRESETS.openai.models.join(', '))
+  const [capabilities, setCapabilities] = useState<string[]>(['chat'])
+  const [dimsInput, setDimsInput] = useState<string>('')
+  const [formError, setFormError] = useState<string | null>(null)
 
   const resetForm = () => {
     setName(''); setType('openai'); setApiBase(PRESETS.openai.apiBase); setApiKey(''); setModelsInput(PRESETS.openai.models.join(', '))
+    setCapabilities(['chat'])
+    setDimsInput('')
+    setFormError(null)
     setEditId(null); setShowForm(false)
   }
 
@@ -55,11 +68,38 @@ export default function ProvidersPage() {
     }
   }
 
+  const toggleCapability = (cap: string) => {
+    setFormError(null)
+    setCapabilities((prev) =>
+      prev.includes(cap) ? prev.filter((c) => c !== cap) : [...prev, cap],
+    )
+  }
+
+  // Cross-field validation matches backend: embedding capability → dims required.
+  const validateForm = (): string | null => {
+    if (!name.trim()) return 'Name is required'
+    if (!apiBase.trim()) return 'API Base URL is required'
+    if (capabilities.length === 0) return 'Select at least one capability'
+    if (capabilities.includes('embedding')) {
+      const n = Number(dimsInput)
+      if (!/^\d+$/.test(dimsInput) || !Number.isInteger(n) || n <= 0) {
+        return 'Dimensions must be a positive integer when Embedding capability is enabled'
+      }
+    }
+    return null
+  }
+
   const handleCreate = async () => {
-    if (!name.trim() || !apiBase.trim()) return
+    const err = validateForm()
+    if (err) { setFormError(err); return }
     const models = modelsInput.split(',').map((m) => m.trim()).filter(Boolean)
-    await createProvider({ name, type, apiBase, apiKey: apiKey || undefined, models })
-    resetForm(); mutate()
+    const dims = capabilities.includes('embedding') ? Number(dimsInput) : null
+    try {
+      await createProvider({ name, type, apiBase, apiKey: apiKey || undefined, models, capabilities, dims })
+      resetForm(); mutate()
+    } catch (e: any) {
+      setFormError(e?.message?.replace(/^API \d+: /, '') || 'Create failed')
+    }
   }
 
   const handleEdit = (p: any) => {
@@ -68,16 +108,27 @@ export default function ProvidersPage() {
     setType(p.type)
     setApiBase(p.api_base)
     setApiKey('')
-    const models = (() => { try { return JSON.parse(p.models || '[]') } catch { return [] } })()
+    const models: string[] = Array.isArray(p.models) ? p.models : []
     setModelsInput(models.join(', '))
+    const caps: string[] = Array.isArray(p.capabilities) && p.capabilities.length > 0 ? p.capabilities : ['chat']
+    setCapabilities(caps)
+    setDimsInput(typeof p.dims === 'number' ? String(p.dims) : '')
+    setFormError(null)
     setShowForm(true)
   }
 
   const handleUpdate = async () => {
-    if (!editId || !name.trim()) return
+    if (!editId) return
+    const err = validateForm()
+    if (err) { setFormError(err); return }
     const models = modelsInput.split(',').map((m) => m.trim()).filter(Boolean)
-    await updateProvider(editId, { name, apiBase, apiKey: apiKey || undefined, models })
-    resetForm(); mutate()
+    const dims = capabilities.includes('embedding') ? Number(dimsInput) : null
+    try {
+      await updateProvider(editId, { name, apiBase, apiKey: apiKey || undefined, models, capabilities, dims })
+      resetForm(); mutate()
+    } catch (e: any) {
+      setFormError(e?.message?.replace(/^API \d+: /, '') || 'Update failed')
+    }
   }
 
   const handleDelete = async (id: string) => {
@@ -121,7 +172,7 @@ export default function ProvidersPage() {
             <input className="input" placeholder="API Base URL" value={apiBase} onChange={(e) => setApiBase(e.target.value)} />
             <input
               className="input"
-              placeholder={`${keyLabel} (optional — stored encrypted)`}
+              placeholder={editId ? `${keyLabel} (leave blank to keep existing key)` : `${keyLabel} (optional — stored encrypted)`}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               type="password"
@@ -132,6 +183,39 @@ export default function ProvidersPage() {
               value={modelsInput}
               onChange={(e) => setModelsInput(e.target.value)}
             />
+
+            {/* Capabilities + dims — drives System Settings → Embedding picker */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Capabilities</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-3)' }}>
+                {CAPABILITY_OPTIONS.map((opt) => (
+                  <label key={opt.value} style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', cursor: 'pointer', fontSize: '0.85rem' }}>
+                    <input
+                      type="checkbox"
+                      checked={capabilities.includes(opt.value)}
+                      onChange={() => toggleCapability(opt.value)}
+                    />
+                    <span>{opt.label}</span>
+                  </label>
+                ))}
+              </div>
+              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                {capabilities.includes('embedding')
+                  ? '🔍 Embedding selected — set Dimensions below. This provider will appear in the System Settings → Embedding picker.'
+                  : '💬 Chat-only — used for corn_chat / LLM routing.'}
+              </div>
+            </div>
+
+            {capabilities.includes('embedding') && (
+              <input
+                className="input"
+                placeholder="Dimensions (e.g. 1024 for bge-m3, 1536 for text-embedding-3-small)"
+                value={dimsInput}
+                onChange={(e) => { setDimsInput(e.target.value); setFormError(null) }}
+                inputMode="numeric"
+              />
+            )}
+
             {(type === 'copilot' || type === 'github-models') && (
               <div style={{ background: 'var(--bg-accent)', border: '1px solid rgba(251,191,36,0.2)', borderRadius: 'var(--radius-md)', padding: 'var(--space-3) var(--space-4)', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
                 {type === 'copilot'
@@ -139,6 +223,13 @@ export default function ProvidersPage() {
                   : '🐙 GitHub Models free tier — create a PAT at github.com/settings/tokens (no scopes needed).'}
               </div>
             )}
+
+            {formError && (
+              <div style={{ padding: 'var(--space-2) var(--space-3)', background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.3)', borderRadius: 'var(--radius-sm)', fontSize: '0.8rem', color: '#f87171' }}>
+                ⚠ {formError}
+              </div>
+            )}
+
             <button className="btn btn-primary" onClick={editId ? handleUpdate : handleCreate} style={{ alignSelf: 'flex-start' }}>
               {editId ? 'Save Changes' : 'Add Provider'}
             </button>
@@ -149,8 +240,8 @@ export default function ProvidersPage() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 'var(--space-4)' }}>
         {data?.providers && data.providers.length > 0 ? (
           data.providers.map((p: any) => {
-            const capabilities = (() => { try { return JSON.parse(p.capabilities || '[]') } catch { return [] } })()
-            const models = (() => { try { return JSON.parse(p.models || '[]') } catch { return [] } })()
+            const capabilities: string[] = Array.isArray(p.capabilities) ? p.capabilities : []
+            const models: string[] = Array.isArray(p.models) ? p.models : []
             const icon = TYPE_ICONS[p.type] || '🧠'
             return (
               <div key={p.id} className="card">
@@ -162,11 +253,23 @@ export default function ProvidersPage() {
                   <span className={`badge badge-${p.status === 'enabled' ? 'healthy' : 'error'}`}>{p.status}</span>
                 </div>
                 <code style={{ display: 'block', marginTop: 'var(--space-3)', fontSize: '0.75rem', color: 'var(--text-secondary)', wordBreak: 'break-all' }}>{p.api_base}</code>
-                {capabilities.length > 0 && (
+                {p.api_key_set && (
+                  <div style={{ marginTop: 'var(--space-2)', display: 'flex', alignItems: 'center', gap: 'var(--space-2)', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                    <span>🔑</span>
+                    <code style={{ fontSize: '0.72rem' }}>{p.api_key_masked || '••••'}</code>
+                    {p.api_key_encrypted === false && (
+                      <span style={{ padding: '1px 6px', background: 'rgba(248,113,113,0.1)', color: '#f87171', borderRadius: '99px', fontSize: '0.65rem' }}>plaintext</span>
+                    )}
+                  </div>
+                )}
+                {(capabilities.length > 0 || typeof p.dims === 'number') && (
                   <div style={{ display: 'flex', gap: 'var(--space-2)', marginTop: 'var(--space-3)', flexWrap: 'wrap' }}>
                     {capabilities.map((c: string) => (
                       <span key={c} style={{ padding: '2px 8px', background: 'var(--bg-accent)', borderRadius: '99px', fontSize: '0.7rem', color: 'var(--corn-gold)' }}>{c}</span>
                     ))}
+                    {typeof p.dims === 'number' && p.dims > 0 && (
+                      <span style={{ padding: '2px 8px', background: 'rgba(56,189,248,0.1)', borderRadius: '99px', fontSize: '0.7rem', color: '#38bdf8' }}>{p.dims}d</span>
+                    )}
                   </div>
                 )}
                 {models.length > 0 && (

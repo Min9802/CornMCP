@@ -12,6 +12,7 @@ import {
   migrateFromEnv,
   DEFAULT_SETTINGS,
 } from '../services/settings.js'
+import { resolveEmbeddingConfig } from '../services/embedding-config.js'
 import {
   DEFAULT_TASK_ENGINES,
   getTaskEngineConfig,
@@ -264,6 +265,24 @@ settingsSub.get('/audit/:key', async (c) => {
 })
 
 systemRouter.route('/settings', settingsSub)
+
+// ─── Embedding Config (MCP-facing) ──────────────────────
+// Read-only endpoint mounted as a sibling of /settings/* so corn-mcp
+// (authenticated by X-API-Key) can fetch the live embedding config
+// without going through the admin-only JWT path.
+//
+// Priority per field: DB row > env var > null. Secret api_key is
+// decrypted server-side via getSetting() and returned in plaintext
+// over the internal HTTP boundary — callers MUST NOT log the response.
+//
+// Why a dedicated route instead of letting MCP hit /settings/:key:
+//   1. /settings/* is admin-JWT-gated; MCP holds X-API-Key, not a JWT.
+//   2. Bundles 4 reads into 1 round-trip (cold-start latency matters).
+//   3. Lets the API decide what's safe to expose to non-admin callers.
+systemRouter.get('/embedding-config', anyAuthMiddleware, async (c) => {
+  const payload = await resolveEmbeddingConfig()
+  return c.json(payload)
+})
 
 // ─── Task Engines (S5.4) ────────────────────────────────
 // Two sub-routers because dispatcher (corn-mcp) needs read-only access

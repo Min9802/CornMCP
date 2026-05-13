@@ -6,7 +6,7 @@
 // unauthenticated users; we additionally gate by role to avoid a flash of
 // admin UI during the SWR revalidate race).
 
-import { useMemo, useState, useEffect, useCallback } from 'react'
+import { useMemo, useState, useEffect, useCallback, createContext, useContext } from 'react'
 import useSWR, { useSWRConfig } from 'swr'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import { getMe } from '@/lib/auth'
@@ -17,6 +17,7 @@ import {
   revealSystemSetting,
   getSystemSettingAudit,
   migrateSystemSettingsFromEnv,
+  getEmbeddingCandidates,
   type SystemSetting,
   type SystemSettingDefault,
   type SystemSettingAudit,
@@ -44,6 +45,24 @@ function sourceBadge(row?: SystemSetting) {
   if (row.value_set) return { label: 'DB', cls: 'badge-healthy' }
   return { label: 'env / default', cls: 'badge-warning' }
 }
+
+// ─── Embedding preset context (Phase 1) ──────────────────
+// Lets EmbeddingPresetSelector push values into multiple SettingRowEditors
+// at once without lifting every field's local state up to the parent.
+// Each editor watches `version` and adopts the matching `values[key]`
+// when version increments — so re-applying the same preset re-fires the
+// fill (e.g. user nudged a field then wants to revert).
+interface PresetApplyState {
+  values: Record<string, string>
+  version: number
+}
+const PresetApplyContext = createContext<PresetApplyState>({ values: {}, version: 0 })
+
+// Note: the hardcoded EMBEDDING_PRESETS dropdown was replaced by
+// EmbeddingProviderPicker — see below. Admins now select a real
+// configured Provider Account row instead of choosing from a fixed list,
+// which removes the `host.docker.internal` confusion and keeps a single
+// source of truth in `provider_accounts`.
 
 type Tab = 'env' | 'audit' | 'tasks'
 
@@ -194,6 +213,13 @@ function EnvironmentTab({
   const [dirtyMap, setDirtyMap] = useState<Record<string, DirtyEntry>>({})
   const [savingAll, setSavingAll] = useState(false)
   const [saveAllMsg, setSaveAllMsg] = useState<string | null>(null)
+  // Preset apply broadcast: incrementing `version` triggers row editors
+  // to adopt `values[row.key]`. Reset to a sentinel each apply so the
+  // same preset can be re-fired (idempotent UX).
+  const [presetState, setPresetState] = useState<PresetApplyState>({ values: {}, version: 0 })
+  const applyPreset = useCallback((values: Record<string, string>) => {
+    setPresetState((prev) => ({ values, version: prev.version + 1 }))
+  }, [])
 
   const trackDirty = useCallback(
     (key: string, value: string | null, hasError: boolean, row: EnvRow) => {
@@ -428,19 +454,22 @@ function EnvironmentTab({
       {categories.length === 0 ? (
         <div className="card" style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No settings registered.</div>
       ) : (
-        categories.map((cat) => (
-          <CategorySection
-            key={cat}
-            category={cat}
-            rows={grouped[cat]!}
-            onDirtyChange={trackDirty}
-            onChanged={() => {
-              refresh()
-              // The key-scoped audit list also caches; bust it on any change.
-              void mutate((k) => typeof k === 'string' && k.startsWith('sys-audit:'), undefined, { revalidate: false })
-            }}
-          />
-        ))
+        <PresetApplyContext.Provider value={presetState}>
+          {categories.map((cat) => (
+            <CategorySection
+              key={cat}
+              category={cat}
+              rows={grouped[cat]!}
+              onDirtyChange={trackDirty}
+              onApplyPreset={cat === 'embedding' ? applyPreset : undefined}
+              onChanged={() => {
+                refresh()
+                // The key-scoped audit list also caches; bust it on any change.
+                void mutate((k) => typeof k === 'string' && k.startsWith('sys-audit:'), undefined, { revalidate: false })
+              }}
+            />
+          ))}
+        </PresetApplyContext.Provider>
       )}
     </>
   )
@@ -451,22 +480,179 @@ function CategorySection({
   rows,
   onChanged,
   onDirtyChange,
+  onApplyPreset,
 }: {
   category: string
   rows: EnvRow[]
   onChanged: () => void
   onDirtyChange: (key: string, value: string | null, hasError: boolean, row: EnvRow) => void
+  /** Only the embedding category receives this — drives the preset dropdown. */
+  onApplyPreset?: (values: Record<string, string>) => void
 }) {
   return (
     <div className="card" style={{ marginBottom: 'var(--space-5)' }}>
       <h3 style={{ fontWeight: 700, fontSize: '1rem', marginBottom: 'var(--space-4)', textTransform: 'capitalize', color: 'var(--corn-gold)' }}>
         {category} <span style={{ color: 'var(--text-muted)', fontWeight: 500, fontSize: '0.8rem' }}>({rows.length})</span>
       </h3>
+      {onApplyPreset && (
+        <EmbeddingProviderPicker
+          onApply={onApplyPreset}
+          currentProviderId={
+            // Surface the saved provider_id so the picker can highlight
+            // the currently-active row. Read the value as-is (not masked
+            // — provider_id is non-secret) and treat '' as null.
+            (() => {
+              const r = rows.find((x) => x.key === 'embedding.provider_id')
+              const v = r?.row?.value_masked || ''
+              return v && r?.row?.value_set ? v : null
+            })()
+          }
+        />
+      )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
         {rows.map((r) => (
           <SettingRowEditor key={r.key} row={r} onChanged={onChanged} onDirtyChange={onDirtyChange} />
         ))}
       </div>
+    </div>
+  )
+}
+
+// ─── Embedding provider picker ──────────────────────────
+// Replaces the old hardcoded EMBEDDING_PRESETS dropdown. Pulls live rows
+// from /api/providers/embedding-candidates so the admin selects an actual
+// configured Provider Account row (with their real api_base + key). The
+// backend resolver then reads from `provider_accounts` on every request,
+// overriding the 4 manual fallback fields.
+//
+// Actions:
+//   • Picking a provider → sets `embedding.provider_id` dirty + applies
+//     hint values into the api_base/model/dims fields (visual reference;
+//     not authoritative — backend reads provider live).
+//   • "Manual config" option → clears `embedding.provider_id` so the
+//     legacy 4-key path takes over.
+//
+// Lives at the top of the embedding category section. Other categories
+// don't render it (passed via `onApplyPreset` from EnvironmentTab).
+function EmbeddingProviderPicker({
+  onApply,
+  currentProviderId,
+}: {
+  onApply: (values: Record<string, string>) => void
+  currentProviderId: string | null
+}) {
+  const { data, isLoading, error } = useSWR('embedding-candidates', getEmbeddingCandidates, { revalidateOnFocus: false })
+  const providers = data?.providers ?? []
+  // Initialise from server state so users land on the currently-active
+  // row without needing to re-pick after refresh. Use the saved provider
+  // id when it matches a known row; otherwise leave the action dropdown
+  // empty (the live setting will still show in the row editor below).
+  const [selected, setSelected] = useState<string>('')
+  useEffect(() => {
+    if (!currentProviderId) {
+      setSelected('')
+      return
+    }
+    // Only auto-select when the providers list has loaded AND the id
+    // matches something — otherwise '' keeps the dropdown neutral.
+    if (providers.find((p: any) => p.id === currentProviderId)) {
+      setSelected(currentProviderId)
+    }
+  }, [currentProviderId, providers])
+  const [appliedNote, setAppliedNote] = useState<string | null>(null)
+
+  const handleChange = (value: string) => {
+    setSelected(value)
+    setAppliedNote(null)
+    if (value === '') {
+      // No-op until user actively picks something.
+      return
+    }
+    if (value === '__manual__') {
+      // Clear `embedding.provider_id` so /embedding-config falls back to
+      // the 4 manual keys. The 4 fields keep whatever they had on the
+      // server — user can edit them directly below.
+      onApply({ 'embedding.provider_id': '' })
+      setAppliedNote('Provider link cleared. The 4 manual fields below are now authoritative — edit them directly + Save All.')
+      return
+    }
+    const p = providers.find((row: any) => row.id === value)
+    if (!p) return
+    // Set provider_id + mirror api_base/model/dims into the manual fields
+    // for visibility. Server-side, the manual fields are IGNORED whenever
+    // `embedding.provider_id` is set — these are reference values only.
+    const firstModel = Array.isArray(p.models) && p.models.length > 0 ? p.models[0] : ''
+    onApply({
+      'embedding.provider_id': value,
+      'embedding.api_base': p.api_base || '',
+      'embedding.model': firstModel,
+      'embedding.dims': typeof p.dims === 'number' ? String(p.dims) : '',
+    })
+    setAppliedNote(`Linked to provider "${p.name}" (${p.api_base}). Click Save All to activate.`)
+  }
+
+  const selectedProvider = selected && selected !== '__manual__'
+    ? providers.find((p: any) => p.id === selected)
+    : null
+
+  return (
+    <div
+      style={{
+        marginBottom: 'var(--space-4)',
+        padding: 'var(--space-3) var(--space-4)',
+        background: 'rgba(251,191,36,0.06)',
+        border: '1px solid rgba(251,191,36,0.2)',
+        borderRadius: 'var(--radius-md)',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
+        <div style={{ flex: '0 0 auto' }}>
+          <div style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--corn-gold)', marginBottom: 2 }}>
+            ⚡ Active embedding provider
+          </div>
+          <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+            Link a Provider Account (capability=embedding) to drive Mem9. Manage providers at <code>/providers</code>.
+          </div>
+        </div>
+        <select
+          className="input"
+          value={selected}
+          onChange={(e) => handleChange(e.target.value)}
+          disabled={isLoading || !!error}
+          style={{ flex: '1 1 260px', minWidth: 260, maxWidth: 380 }}
+        >
+          <option value="">— Choose action —</option>
+          {providers.length === 0 && !isLoading && (
+            <option value="" disabled>No embedding-capable providers yet</option>
+          )}
+          {providers.map((p: any) => (
+            <option key={p.id} value={p.id}>
+              {(p.type === 'openai' ? '🟢' : p.type === 'anthropic' ? '🟣' : p.type === 'ollama' ? '🦙' : '⚙️')} {p.name} · {p.api_base}{typeof p.dims === 'number' ? ` · ${p.dims}d` : ''}
+            </option>
+          ))}
+          <option value="__manual__">🔧 Manual config (clear link, use the 4 fields below)</option>
+        </select>
+      </div>
+      {error && (
+        <div style={{ marginTop: 'var(--space-2)', fontSize: '0.78rem', color: '#f87171' }}>
+          ⚠ Failed to load providers: {String((error as any)?.message || error)}
+        </div>
+      )}
+      {!isLoading && !error && providers.length === 0 && (
+        <div style={{ marginTop: 'var(--space-2)', fontSize: '0.78rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+          💡 No embedding-capable providers configured yet. Head to <code>/providers</code> → Add Provider → enable <strong>Embedding</strong> capability + set <strong>Dimensions</strong>. Then come back here.
+        </div>
+      )}
+      {selectedProvider && (
+        <div style={{ marginTop: 'var(--space-2)', fontSize: '0.78rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+          🔍 Will use <code>{selectedProvider.api_base}</code> with model <code>{Array.isArray(selectedProvider.models) && selectedProvider.models[0] ? selectedProvider.models[0] : '(none — falls back to manual)'}</code> and <code>{typeof selectedProvider.dims === 'number' ? `${selectedProvider.dims}d` : '(no dims — falls back to manual)'}</code>.
+        </div>
+      )}
+      {appliedNote && (
+        <div style={{ marginTop: 'var(--space-2)', fontSize: '0.78rem', color: 'var(--corn-green)', fontWeight: 500 }}>
+          ✓ {appliedNote}
+        </div>
+      )}
     </div>
   )
 }
@@ -497,6 +683,25 @@ function SettingRowEditor({
     setRevealError(null)
     setSaveMsg(null)
   }, [row.key, row.row?.value_masked, row.row?.value_set])
+
+  // Adopt preset values from the embedding provider dropdown. Watching
+  // `version` (not `values`) so re-applying the same preset re-fires
+  // the fill — useful when the user nudged a field then wants to
+  // restore from preset. Cancels any active reveal so the masked input
+  // toggles back to displaying the new value verbatim.
+  const presetCtx = useContext(PresetApplyContext)
+  useEffect(() => {
+    if (presetCtx.version === 0) return
+    const incoming = presetCtx.values[row.key]
+    if (incoming === undefined) return
+    setLocalValue(incoming)
+    setRevealed(null)
+    setSaveMsg(null)
+    // Intentionally omit `presetCtx.values` from deps — we only re-fire
+    // when version increments (i.e. user picked a new preset), not on
+    // every render where the values reference happens to be new.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [presetCtx.version])
 
   // Auto re-mask after 60s for safety.
   useEffect(() => {

@@ -128,13 +128,30 @@ export const deleteApiKey = (id: string) =>
 export const getOrganizations = () =>
   apiFetch<{ organizations: any[] }>('/api/orgs')
 
-export const createOrganization = (data: { name: string; description?: string }) =>
-  apiFetch<{ ok: boolean; id: string }>('/api/orgs', {
+/**
+ * Create an organization. Admin callers may pass `userId` to assign the
+ * org to another user; omitting it (or passing empty string) keeps the
+ * current admin as the owner. Non-admin callers always own their orgs.
+ */
+export const createOrganization = (data: {
+  name: string
+  description?: string
+  userId?: string
+}) =>
+  apiFetch<{ ok: boolean; id: string; userId?: string }>('/api/orgs', {
     method: 'POST',
     body: JSON.stringify(data),
   })
 
-export const updateOrganization = (id: string, data: { name: string; description?: string }) =>
+/**
+ * Update an organization. Admin callers may pass `userId` to reassign
+ * ownership (empty string = reassign to current admin). Field is ignored
+ * when omitted, preserving the existing owner.
+ */
+export const updateOrganization = (
+  id: string,
+  data: { name: string; description?: string; userId?: string },
+) =>
   apiFetch<{ ok: boolean }>(`/api/orgs/${id}`, {
     method: 'PUT',
     body: JSON.stringify(data),
@@ -146,7 +163,20 @@ export const deleteOrganization = (id: string) =>
 // ─── Providers ──────────────────────────────────────────
 export const getProviders = () => apiFetch<{ providers: any[] }>('/api/providers')
 
-export const createProvider = (data: { name: string; type: string; apiBase: string; apiKey?: string; models?: string[] }) =>
+// Embedding-capable providers — drives the System Settings embedding picker.
+// Admin-only; returns all enabled providers tagged with capability=embedding.
+export const getEmbeddingCandidates = () =>
+  apiFetch<{ providers: any[] }>('/api/providers/embedding-candidates')
+
+export const createProvider = (data: {
+  name: string
+  type: string
+  apiBase: string
+  apiKey?: string
+  models?: string[]
+  capabilities?: string[]
+  dims?: number | null
+}) =>
   apiFetch<{ ok: boolean; id: string }>('/api/providers', {
     method: 'POST',
     body: JSON.stringify(data),
@@ -155,7 +185,15 @@ export const createProvider = (data: { name: string; type: string; apiBase: stri
 export const deleteProvider = (id: string) =>
   apiFetch<{ ok: boolean }>(`/api/providers/${id}`, { method: 'DELETE' })
 
-export const updateProvider = (id: string, data: { name?: string; apiBase?: string; apiKey?: string; models?: string[]; status?: string }) =>
+export const updateProvider = (id: string, data: {
+  name?: string
+  apiBase?: string
+  apiKey?: string
+  models?: string[]
+  status?: string
+  capabilities?: string[]
+  dims?: number | null
+}) =>
   apiFetch<{ ok: boolean }>(`/api/providers/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(data),
@@ -199,8 +237,11 @@ export interface ToolAnalytics {
   }[]
 }
 
-export const getToolAnalytics = (days = 30) =>
-  apiFetch<ToolAnalytics>(`/api/analytics/tool-analytics?days=${days}`)
+export const getToolAnalytics = (days = 30, opts?: { all?: boolean }) => {
+  const qs = new URLSearchParams({ days: String(days) })
+  if (opts?.all) qs.set('all', '1')
+  return apiFetch<ToolAnalytics>(`/api/analytics/tool-analytics?${qs.toString()}`)
+}
 
 // ─── Users (admin only) ──────────────────────────────────
 export interface UserRecord {

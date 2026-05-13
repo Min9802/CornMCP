@@ -377,11 +377,16 @@ export interface DefaultSettingSpec {
 }
 
 export const DEFAULT_SETTINGS: readonly DefaultSettingSpec[] = [
-  // Embedding (4)
-  { key: 'embedding.api_key', category: 'embedding', description: 'API key for the embedding provider (OpenAI-compatible / Voyage).', isSecret: true, envVar: 'OPENAI_API_KEY' },
-  { key: 'embedding.api_base', category: 'embedding', description: 'Base URL for the embedding provider.', isSecret: false, envVar: 'OPENAI_API_BASE', defaultValue: 'https://api.voyageai.com/v1' },
-  { key: 'embedding.model', category: 'embedding', description: 'Embedding model identifier (must match provider catalogue).', isSecret: false, envVar: 'MEM9_EMBEDDING_MODEL', defaultValue: 'voyage-code-3' },
-  { key: 'embedding.dims', category: 'embedding', description: 'Vector dimensionality — must match the vector store column size.', isSecret: false, envVar: 'MEM9_EMBEDDING_DIMS', defaultValue: '1024' },
+  // Embedding (5)
+  // `embedding.provider_id` — when set, overrides the 4 manual fields below by
+  // resolving api_key/api_base/model/dims from a configured Provider Account
+  // (capabilities=['embedding']). When null, the 4 manual fields stay
+  // authoritative — preserves backward compat for existing deployments.
+  { key: 'embedding.provider_id', category: 'embedding', description: 'Reference to a Provider Account (capability=embedding). Overrides the manual fields below when set.', isSecret: false },
+  { key: 'embedding.api_key', category: 'embedding', description: 'API key for the embedding provider (OpenAI-compatible / Voyage). Ignored when `embedding.provider_id` is set.', isSecret: true, envVar: 'OPENAI_API_KEY' },
+  { key: 'embedding.api_base', category: 'embedding', description: 'Base URL for the embedding provider. Ignored when `embedding.provider_id` is set.', isSecret: false, envVar: 'OPENAI_API_BASE', defaultValue: 'https://api.voyageai.com/v1' },
+  { key: 'embedding.model', category: 'embedding', description: 'Embedding model identifier (must match provider catalogue). Ignored when `embedding.provider_id` is set.', isSecret: false, envVar: 'MEM9_EMBEDDING_MODEL', defaultValue: 'voyage-code-3' },
+  { key: 'embedding.dims', category: 'embedding', description: 'Vector dimensionality — must match the vector store column size. Ignored when `embedding.provider_id` is set.', isSecret: false, envVar: 'MEM9_EMBEDDING_DIMS', defaultValue: '1024' },
 
   // Mail (8)
   { key: 'mail.host', category: 'mail', description: 'SMTP relay host for OTP + notification emails.', isSecret: false, envVar: 'MAIL_HOST' },

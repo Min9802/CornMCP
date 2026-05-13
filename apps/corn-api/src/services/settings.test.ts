@@ -299,6 +299,6 @@ test('migrateFromEnv seeds missing keys from env and skips present rows on re-ru
   assert.ok(alreadySet.has('embedding.api_base'))
 
   // Sanity: schema shape matches what the UI expects.
-  // 18 = embedding (4) + mail (8) + auth (3) + session (1) + llm bootstrap (2).
-  assert.equal(DEFAULT_SETTINGS.length, 18, 'schema pins 18 default keys')
+  // 19 = embedding (5: provider_id + 4 manual fallbacks) + mail (8) + auth (3) + session (1) + llm bootstrap (2).
+  assert.equal(DEFAULT_SETTINGS.length, 19, 'schema pins 19 default keys')
 })
