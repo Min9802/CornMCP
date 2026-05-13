@@ -97,7 +97,7 @@ async function run() {
   // IMPORTANT: We must install interceptors AFTER server.connect() because
   // the MCP SDK only assigns transport.onmessage during connect().
   // Before connect(), transport.onmessage is undefined.
-  const pendingReqs = new Map<any, { tool: string; start: number; inputSize: number }>()
+  const pendingReqs = new Map<any, { tool: string; start: number; inputText: string }>()
   const apiUrl = (env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
 
   // Intercept outgoing responses (send) — must be set BEFORE connect so the
@@ -110,9 +110,13 @@ async function run() {
 
       const latencyMs = Date.now() - req.start
       const status = message.error ? 'error' : 'ok'
-      const outputSize = JSON.stringify(message).length
-      const computeTokens = estimateComputeTokens(req.inputSize, outputSize)
-      const tokensSaved = status === 'ok' ? estimateTokensSaved(req.tool, outputSize) : 0
+      const outputText = JSON.stringify(message)
+      // input_size / output_size are UTF-8 byte counts (not UTF-16 .length)
+      // so the persisted metric is consistent across non-ASCII payloads.
+      const inputSize = Buffer.byteLength(req.inputText, 'utf8')
+      const outputSize = Buffer.byteLength(outputText, 'utf8')
+      const computeTokens = estimateComputeTokens(req.inputText, outputText)
+      const tokensSaved = status === 'ok' ? estimateTokensSaved(req.tool, outputText) : 0
 
       const telemetryHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
       if (env.DASHBOARD_API_KEY) telemetryHeaders['X-API-Key'] = env.DASHBOARD_API_KEY
@@ -124,7 +128,7 @@ async function run() {
           tool: req.tool,
           status,
           latencyMs,
-          inputSize: req.inputSize,
+          inputSize,
           outputSize,
           computeTokens,
           tokensSaved,
@@ -147,7 +151,7 @@ async function run() {
           pendingReqs.set(message.id, {
             tool: toolName,
             start: Date.now(),
-            inputSize: JSON.stringify(message).length,
+            inputText: JSON.stringify(message),
           })
           console.error(`[telemetry] 🔧 ${toolName} called`)
         }

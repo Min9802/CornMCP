@@ -284,17 +284,23 @@ app.all('/mcp', async (c) => {
       // Best-effort: clone the response so we can measure its body length
       // without consuming the original stream. Transport runs with
       // enableJsonResponse, so the body is a finite JSON payload.
+      // REQUIRES enableJsonResponse: true. SSE/streaming responses would
+      // break response.clone().text() here and need a redesign of the size
+      // measurement pipeline.
       const status = response.status >= 400 ? 'error' : 'ok'
-      let outputSize = 0
+      let responseText = ''
       try {
-        outputSize = (await response.clone().text()).length
+        responseText = await response.clone().text()
       } catch {
-        // If clone/read fails (e.g. streamed body), fall back to 0 — usage and
-        // savings simply won't be counted for this call.
+        // If clone/read fails (e.g. streamed body), fall back to empty —
+        // usage and savings simply won't be counted for this call.
       }
-      const inputSize = bodyText.length
-      const computeTokens = estimateComputeTokens(inputSize, outputSize)
-      const tokensSaved = status === 'ok' ? estimateTokensSaved(toolName, outputSize) : 0
+      // input_size / output_size are UTF-8 byte counts (not UTF-16 .length)
+      // so the persisted metric is consistent across non-ASCII payloads.
+      const inputSize = Buffer.byteLength(bodyText, 'utf8')
+      const outputSize = Buffer.byteLength(responseText, 'utf8')
+      const computeTokens = estimateComputeTokens(bodyText, responseText)
+      const tokensSaved = status === 'ok' ? estimateTokensSaved(toolName, responseText) : 0
 
       const apiUrl = (envWithOwner.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
       const telemetryHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
