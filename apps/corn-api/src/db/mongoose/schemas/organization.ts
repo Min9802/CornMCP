@@ -1,5 +1,7 @@
-// Organizations — multi-tenant container. A default `org-default` row is
-// seeded by initSchemas() so single-user deployments work out of the box.
+// Organizations — multi-tenant container. Every org must be owned by a user;
+// the legacy shared `org-default` seed has been removed to prevent cross-tenant
+// scope leakage. New users get an org auto-provisioned on first project create
+// or explicitly via POST /api/orgs.
 import { Schema, model, type InferSchemaType } from 'mongoose'
 
 const organizationSchema = new Schema(
@@ -8,8 +10,8 @@ const organizationSchema = new Schema(
     name: { type: String, required: true, minlength: 1 },
     slug: { type: String, required: true, unique: true, lowercase: true, trim: true },
     description: { type: String, default: null },
-    // Added by SQLite migration 0001 — owner of the org. Null on the
-    // seed `org-default` row so the bootstrap remains shared.
+    // Owner of the org. Default null is kept for migration compatibility; new
+    // rows MUST set user_id explicitly via the create routes.
     user_id: { type: String, default: null, index: true },
   },
   {

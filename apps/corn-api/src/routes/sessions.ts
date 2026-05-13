@@ -2,18 +2,38 @@
 // helpers used to lean on SQL string functions (LOWER, REPLACE) — we
 // reproduce them with case-insensitive regex + a small JS post-filter.
 //
-// Ownership scope: a project is "in scope" if its org belongs to the
-// user OR has a null user_id (legacy global org seeded as `org-default`).
+// Ownership scope: a project is "in scope" if its org belongs to the user.
 
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { generateId } from '@corn/shared-utils'
-import { Organization, Project, SessionHandoff } from '../db/mongoose/index.js'
+import { ApiKey, Organization, Project, SessionHandoff } from '../db/mongoose/index.js'
 import {
   jwtAuthMiddleware,
   apiKeyAuthMiddleware,
   getAuthCtx,
   getAgentCtx,
 } from '../middleware/auth.js'
+
+/**
+ * Verify the calling API key may mutate the given session. Allowed when:
+ *   - session.from_agent === current API key (same key wrote it), OR
+ *   - session.from_agent belongs to a sibling key owned by the same user.
+ *
+ * Returns null on success, or a Response (404/403) on failure that the caller
+ * should return immediately.
+ */
+async function assertSessionMutateAccess(c: Context, sessionId: string) {
+  const { agentKeyId, agentUserId } = getAgentCtx(c)
+  const session = await SessionHandoff.findById(sessionId, { from_agent: 1 }).lean()
+  if (!session) return c.json({ error: 'Session not found' }, 404)
+  if (session.from_agent === agentKeyId) return null
+  if (!agentUserId) return c.json({ error: 'Access denied' }, 403)
+  const ownerKey = await ApiKey.findById(session.from_agent, { user_id: 1 }).lean()
+  if (!ownerKey || ownerKey.user_id !== agentUserId) {
+    return c.json({ error: 'Access denied' }, 403)
+  }
+  return null
+}
 
 export const sessionsRouter = new Hono()
 
@@ -72,12 +92,9 @@ function normalizePath(p: string): string {
   return p.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 }
 
-/** Org IDs the user can see (their own + the legacy global null-owner orgs). */
+/** Org IDs the user owns. */
 async function ownedOrgIds(userId: string): Promise<string[]> {
-  const orgs = await Organization.find(
-    { $or: [{ user_id: userId }, { user_id: null }] },
-    { _id: 1 },
-  ).lean()
+  const orgs = await Organization.find({ user_id: userId }, { _id: 1 }).lean()
   return orgs.map((o) => o._id)
 }
 
@@ -269,6 +286,9 @@ sessionsRouter.post('/', apiKeyAuthMiddleware, async (c) => {
 // long-running agents that periodically PATCH stay out of the auto-close sweep.
 sessionsRouter.patch('/:id', apiKeyAuthMiddleware, async (c) => {
   const { id } = c.req.param()
+  const denied = await assertSessionMutateAccess(c, id)
+  if (denied) return denied
+
   const body = await c.req.json()
 
   // The session_handoffs schema persists `context` as Mixed JSON. Caller
@@ -299,6 +319,9 @@ sessionsRouter.patch('/:id', apiKeyAuthMiddleware, async (c) => {
 // full status change yet. Idempotent and safe to call frequently.
 sessionsRouter.post('/:id/heartbeat', apiKeyAuthMiddleware, async (c) => {
   const { id } = c.req.param()
+  const denied = await assertSessionMutateAccess(c, id)
+  if (denied) return denied
+
   await SessionHandoff.updateOne(
     { _id: id, status: 'active' },
     { $set: { last_activity_at: new Date() } },

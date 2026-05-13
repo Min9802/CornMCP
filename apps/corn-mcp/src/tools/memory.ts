@@ -18,6 +18,7 @@ import {
   type DedupInput,
   type DedupResult,
 } from './dedup.js'
+import { getKeyOwnerUserId } from '../services/key-owner.js'
 
 function apiHeaders(env: McpEnv): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -180,11 +181,17 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
         }
       }
 
+      // Stamp the owner of the API key into the payload so downstream
+      // searches can scope by user. Null userId (key-info lookup failed)
+      // falls through unscoped — better to write than to silently drop.
+      const userId = await getKeyOwnerUserId(env)
+
       await svc.storeMemory(id, content, {
         agent_id: agentId,
         project_id: projectId,
         branch: branch || null,
         tags: finalTags,
+        user_id: userId,
       })
 
       // Best-effort: register a preview row in Dashboard API so the web UI
@@ -261,7 +268,15 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
 
       const svc = await getMem9(env)
 
+      // Always scope by the owner of the calling API key. Without this,
+      // crossProject:true would surface every other tenant's memories.
+      // Null userId (lookup failed) skips the filter so legacy keys keep
+      // working — but the dashboard route in corn-api still enforces
+      // user-level scope via Mongo metadata.
+      const userId = await getKeyOwnerUserId(env)
+
       const filter: Record<string, unknown> = {}
+      if (userId) filter.user_id = userId
       if (!crossProject && projectId) filter.project_id = projectId
       if (branch) filter.branch = branch
 

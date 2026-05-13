@@ -38,14 +38,33 @@ projectsRouter.post('/', async (c) => {
   const { user } = getAuthCtx(c)
   const id = generateId('proj')
   const slug = (body.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
-  const orgId = body.orgId || 'org-default'
 
-  // Verify org belongs to user (non-admin).
-  if (user.role !== 'admin' && body.orgId) {
-    const org = await Organization.findById(body.orgId, { user_id: 1 }).lean()
-    if (!org || org.user_id !== user.id) {
-      return c.json({ error: 'Organization not found or access denied' }, 403)
+  // Resolve org: explicit body.orgId (verified) OR user's first org.
+  // No silent fallback to a shared org — every project must belong to a
+  // user-owned organization to prevent cross-tenant leakage.
+  let orgId: string
+  if (body.orgId) {
+    if (user.role !== 'admin') {
+      const org = await Organization.findById(body.orgId, { user_id: 1 }).lean()
+      if (!org || org.user_id !== user.id) {
+        return c.json({ error: 'Organization not found or access denied' }, 403)
+      }
     }
+    orgId = body.orgId
+  } else {
+    const firstOrg = await Organization.findOne({ user_id: user.id }, { _id: 1 })
+      .sort({ created_at: 1 })
+      .lean()
+    if (!firstOrg) {
+      return c.json(
+        {
+          error:
+            'No organization found. Create an organization first via POST /api/orgs before creating projects.',
+        },
+        400,
+      )
+    }
+    orgId = firstOrg._id
   }
 
   await Project.create({
@@ -58,7 +77,7 @@ projectsRouter.post('/', async (c) => {
     git_provider: body.gitProvider ?? null,
   } as Parameters<typeof Project.create>[0])
 
-  return c.json({ ok: true, id })
+  return c.json({ ok: true, id, orgId })
 })
 
 // Check project ownership (non-admin must own the org that owns the project).

@@ -4,12 +4,6 @@ import { jwtVerify, SignJWT } from 'jose'
 import { hashApiKey } from '@corn/shared-utils'
 import { ApiKey, Organization, Project, User } from '../db/mongoose/index.js'
 
-// Shared organization id seeded by `init-mongo`. Treated as a common org
-// every authenticated user belongs to implicitly. Projects auto-created
-// before a user has linked their own org land here, so they MUST stay
-// accessible from any user scope (memory store, list, etc.).
-const SHARED_ORG_ID = 'org-default'
-
 export interface AuthUser {
   id: string
   email: string
@@ -79,9 +73,6 @@ async function loadUserScope(c: Context, userId: string, role: string) {
 
   const orgs = await Organization.find({ user_id: userId }, { _id: 1 }).lean()
   const orgIds = orgs.map((o) => o._id)
-  // Always include the shared SHARED_ORG_ID so projects auto-created in it
-  // are visible to every authenticated user.
-  if (!orgIds.includes(SHARED_ORG_ID)) orgIds.push(SHARED_ORG_ID)
 
   const [keys, projects] = await Promise.all([
     ApiKey.find({ user_id: userId }, { _id: 1 }).lean(),
@@ -110,13 +101,12 @@ export const adminOnly: MiddlewareHandler = async (c, next) => {
 }
 
 // Resolve every project visible to a given API-key holder.
-// Same two-query strategy as loadUserScope() above. Also includes the
-// shared SHARED_ORG_ID so agent keys can write to projects in the
-// default org without an explicit ownership link.
+// Same two-query strategy as loadUserScope() above. The agent only sees
+// projects in orgs it explicitly owns — no shared-org back door.
 async function loadAgentProjectIds(agentUserId: string): Promise<string[]> {
   const orgs = await Organization.find({ user_id: agentUserId }, { _id: 1 }).lean()
   const orgIds = orgs.map((o) => o._id)
-  if (!orgIds.includes(SHARED_ORG_ID)) orgIds.push(SHARED_ORG_ID)
+  if (orgIds.length === 0) return []
   const projects = await Project.find({ org_id: { $in: orgIds } }, { _id: 1 }).lean()
   return projects.map((p) => p._id)
 }

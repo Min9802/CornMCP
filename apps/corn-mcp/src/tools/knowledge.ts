@@ -18,6 +18,7 @@ import {
   type DedupInput,
   type DedupResult,
 } from './dedup.js'
+import { getKeyOwnerUserId } from '../services/key-owner.js'
 
 function apiHeaders(env: McpEnv): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -170,6 +171,11 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
         }
       }
 
+      // Stamp the owner of the API key so downstream searches can scope by
+      // user. Null userId (lookup failed) falls through unscoped — better to
+      // write than to silently drop.
+      const userId = await getKeyOwnerUserId(env)
+
       // Store in Qdrant vector store (corn_knowledge collection)
       await svc.storeKnowledge(id, content, {
         title,
@@ -177,6 +183,7 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
         project_id: projectId || null,
         tags: finalTags,
         source: 'agent',
+        user_id: userId,
       })
 
       // Also register in Dashboard API if available. Errors are logged
@@ -233,7 +240,13 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
     async ({ query, limit, projectId, tags }) => {
       const svc = await getMem9(env)
 
+      // Scope to the owner of the calling API key so we never surface another
+      // tenant's docs. Null userId skips the filter (legacy keys / lookup
+      // failure); the corn-api dashboard route still enforces tenancy.
+      const userId = await getKeyOwnerUserId(env)
+
       const filter: Record<string, unknown> = {}
+      if (userId) filter.user_id = userId
       if (projectId) filter.project_id = projectId
 
       const results = await svc.searchKnowledge(query, limit, Object.keys(filter).length > 0 ? filter : undefined)

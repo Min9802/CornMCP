@@ -1,6 +1,11 @@
 // Schema initialization: ensure indexes are in sync with each schema's
-// definition AND seed bootstrap singletons (setup_status, org-default).
+// definition AND seed bootstrap singletons (setup_status only).
 // Idempotent — safe to call on every boot.
+//
+// Note: the legacy `org-default` shared organization is no longer seeded.
+// Every user must own their own org (auto-created on first project create or
+// via POST /api/orgs). The previous shared-org pattern caused cross-tenant
+// leaks via auto-merged scope in middleware/auth.ts.
 //
 // Order matters:
 //   1. syncIndexes() per model so unique constraints exist BEFORE seed
@@ -46,18 +51,5 @@ export async function initSchemas(): Promise<void> {
     { upsert: true, setDefaultsOnInsert: true },
   )
 
-  await Models.Organization.findOneAndUpdate(
-    { _id: 'org-default' },
-    {
-      $setOnInsert: {
-        _id: 'org-default',
-        name: 'Personal',
-        slug: 'personal',
-        description: 'Default personal organization',
-      },
-    },
-    { upsert: true, setDefaultsOnInsert: true },
-  )
-
-  logger.info('Bootstrap singletons seeded (setup_status, org-default)')
+  logger.info('Bootstrap singletons seeded (setup_status)')
 }
