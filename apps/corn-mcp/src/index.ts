@@ -255,10 +255,13 @@ app.all('/mcp', async (c) => {
     bodyText = await c.req.text()
   } catch {}
 
+  const method = c.req.raw.method.toUpperCase()
+  const hasBody = method !== 'GET' && method !== 'HEAD'
+
   const newReq = new Request(c.req.raw.url, {
-    method: c.req.raw.method,
+    method,
     headers: c.req.raw.headers,
-    body: bodyText,
+    ...(hasBody ? { body: bodyText } : {}),
   })
 
   // Log tool calls for telemetry
