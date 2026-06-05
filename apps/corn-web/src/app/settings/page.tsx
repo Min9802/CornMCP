@@ -59,7 +59,7 @@ export default function SettingsPage() {
           Add this to your AI agent&apos;s MCP configuration:
         </p>
         <pre style={{ background: 'var(--bg-input)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: 'var(--space-4)', overflow: 'auto', fontSize: '0.8rem', color: 'var(--corn-gold)' }}>
-{`{
+          {`{
   "mcpServers": {
     "corn-hub": {
       "url": "${mcpUrl}/mcp",

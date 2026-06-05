@@ -58,7 +58,7 @@ COPY --from=builder /app/apps/corn-web/.next/standalone ./
 COPY --from=builder /app/apps/corn-web/.next/static ./apps/corn-web/.next/static
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD wget -qO- http://localhost:3000/ > /dev/null || exit 1
+  CMD node -e "fetch('http://localhost:3000/').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
 
 EXPOSE 3000
 

@@ -1,8 +1,11 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
+import crypto from 'node:crypto'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
+import type { Transport, TransportSendOptions } from '@modelcontextprotocol/sdk/shared/transport.js'
+import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js'
 
 import { registerHealthTools } from './tools/health.js'
 import { registerMemoryTools } from './tools/memory.js'
@@ -193,8 +196,88 @@ export function createMcpServer(env: Env) {
   return server
 }
 
+// ─── Hono-compatible SSE Server Transport ─────────────────
+class HonoSSEServerTransport implements Transport {
+  private _sessionId: string
+  private _controller?: ReadableStreamDefaultController
+  private _encoder = new TextEncoder()
+
+  onclose?: () => void
+  onerror?: (error: Error) => void
+  onmessage?: <T extends JSONRPCMessage>(message: T, extra?: any) => void
+
+  constructor(private _postEndpoint: string) {
+    this._sessionId = crypto.randomUUID()
+  }
+
+  get sessionId() {
+    return this._sessionId
+  }
+
+  async start(): Promise<void> {
+    // No-op
+  }
+
+  getStreamResponse(): Response {
+    const stream = new ReadableStream({
+      start: (controller) => {
+        this._controller = controller
+
+        // Send the endpoint event
+        const endpointUrl = new URL(this._postEndpoint, 'http://localhost')
+        endpointUrl.searchParams.set('sessionId', this._sessionId)
+        const relativeUrlWithSession = endpointUrl.pathname + endpointUrl.search + endpointUrl.hash
+
+        const data = `event: endpoint\ndata: ${relativeUrlWithSession}\n\n`
+        controller.enqueue(this._encoder.encode(data))
+      },
+      cancel: () => {
+        this.close()
+      }
+    })
+
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'mcp-session-id': this._sessionId,
+      }
+    })
+  }
+
+  async send(message: JSONRPCMessage, options?: TransportSendOptions): Promise<void> {
+    if (!this._controller) {
+      throw new Error('Not connected')
+    }
+    const data = `event: message\ndata: ${JSON.stringify(message)}\n\n`
+    try {
+      this._controller.enqueue(this._encoder.encode(data))
+    } catch (err) {
+      this.onerror?.(err as Error)
+    }
+  }
+
+  async handlePostMessage(message: JSONRPCMessage, extra?: any): Promise<void> {
+    this.onmessage?.(message, extra)
+  }
+
+  async close(): Promise<void> {
+    if (this._controller) {
+      try {
+        this._controller.close()
+      } catch {}
+      this._controller = undefined
+    }
+    this.onclose?.()
+  }
+}
+
+const sseTransports = new Map<string, HonoSSEServerTransport>()
+
 // ─── MCP Streamable HTTP handler ──────────────────────────
-app.all('/mcp', async (c) => {
+const handleMcpRequest = async (c: any) => {
   const envWithOwner = { ...c.env } as Env & { API_KEY_OWNER?: string }
 
   // Extract raw API key for forwarding to corn-api
@@ -241,6 +324,74 @@ app.all('/mcp', async (c) => {
     )
   }
 
+  const method = c.req.method.toUpperCase()
+
+  // 1. Handle standard SSE GET request to establish connection
+  if (method === 'GET' && c.req.header('accept')?.includes('text/event-stream')) {
+    const transport = new HonoSSEServerTransport('/mcp')
+    const mcpServer = createMcpServer(envWithOwner)
+    await mcpServer.connect(transport)
+
+    sseTransports.set(transport.sessionId, transport)
+    transport.onclose = () => {
+      sseTransports.delete(transport.sessionId)
+    }
+
+    return transport.getStreamResponse()
+  }
+
+  // 2. Handle standard SSE POST messages
+  if (method === 'POST') {
+    const sessionId = c.req.query('sessionId')
+    if (sessionId) {
+      const transport = sseTransports.get(sessionId)
+      if (!transport) {
+        return c.json(
+          {
+            jsonrpc: '2.0',
+            error: { code: -32001, message: 'Session not found' },
+            id: null,
+          },
+          404,
+        )
+      }
+
+      let bodyText = ''
+      try {
+        bodyText = await c.req.text()
+      } catch {}
+
+      try {
+        const message = JSON.parse(bodyText)
+        await transport.handlePostMessage(message)
+        return new Response('Accepted', { status: 202 })
+      } catch (err) {
+        return c.json(
+          {
+            jsonrpc: '2.0',
+            error: { code: -32700, message: 'Parse error' },
+            id: null,
+          },
+          400,
+        )
+      }
+    }
+  }
+
+  // 3. Handle standard SSE DELETE session request
+  if (method === 'DELETE') {
+    const sessionId = c.req.query('sessionId')
+    if (sessionId) {
+      const transport = sseTransports.get(sessionId)
+      if (transport) {
+        await transport.close()
+        sseTransports.delete(sessionId)
+        return new Response('Closed', { status: 200 })
+      }
+    }
+  }
+
+  // Fallback to WebStandardStreamableHTTPServerTransport (Streamable HTTP)
   const mcpServer = createMcpServer(envWithOwner)
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined, // stateless mode
@@ -255,7 +406,6 @@ app.all('/mcp', async (c) => {
     bodyText = await c.req.text()
   } catch {}
 
-  const method = c.req.raw.method.toUpperCase()
   const hasBody = method !== 'GET' && method !== 'HEAD'
 
   const newReq = new Request(c.req.raw.url, {
@@ -336,6 +486,8 @@ app.all('/mcp', async (c) => {
       500,
     )
   }
-})
+}
+app.all('/mcp', handleMcpRequest)
+app.all('/mcp/*', handleMcpRequest)
 
 export default app
