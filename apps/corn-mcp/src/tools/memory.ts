@@ -129,13 +129,25 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
       // falls through unscoped — better to write than to silently drop.
       const userId = await getKeyOwnerUserId(env)
 
-      await svc.storeMemory(id, content, {
-        agent_id: agentId,
-        project_id: projectId,
-        branch: branch || null,
-        tags: finalTags,
-        user_id: userId,
-      })
+      try {
+        await svc.storeMemory(id, content, {
+          agent_id: agentId,
+          project_id: projectId,
+          branch: branch || null,
+          tags: finalTags,
+          user_id: userId,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `❌ Lỗi lưu bộ nhớ phiên (Embedding/Qdrant): ${msg}\n\nVui lòng kiểm tra lại cấu hình hoặc trạng thái hoạt động của Embedding Provider (ví dụ LM Studio).`,
+            },
+          ],
+        }
+      }
 
       // Best-effort: register a preview row in Dashboard API so the web UI
       // can list/audit/delete memories. Failure here must not break the MCP
@@ -223,7 +235,20 @@ export function registerMemoryTools(server: McpServer, env: McpEnv) {
       if (!crossProject && projectId) filter.project_id = projectId
       if (branch) filter.branch = branch
 
-      const results = await svc.searchMemory(query, limit, Object.keys(filter).length > 0 ? filter : undefined)
+      let results: any[]
+      try {
+        results = await svc.searchMemory(query, limit, Object.keys(filter).length > 0 ? filter : undefined)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `❌ Lỗi tìm kiếm bộ nhớ phiên (Embedding/Qdrant): ${msg}\n\nVui lòng kiểm tra lại cấu hình hoặc trạng thái hoạt động của Embedding Provider (ví dụ LM Studio).`,
+            },
+          ],
+        }
+      }
 
       if (results.length === 0) {
         const scopeLabel = crossProject ? 'all projects' : `project ${projectId}`

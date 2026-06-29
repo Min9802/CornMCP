@@ -126,14 +126,26 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
       const userId = await getKeyOwnerUserId(env)
 
       // Store in Qdrant vector store (corn_knowledge collection)
-      await svc.storeKnowledge(id, content, {
-        title,
-        agent_id: agentId,
-        project_id: projectId || null,
-        tags: finalTags,
-        source: 'agent',
-        user_id: userId,
-      })
+      try {
+        await svc.storeKnowledge(id, content, {
+          title,
+          agent_id: agentId,
+          project_id: projectId || null,
+          tags: finalTags,
+          source: 'agent',
+          user_id: userId,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `❌ Lỗi lưu kho tri thức (Embedding/Qdrant): ${msg}\n\nVui lòng kiểm tra lại cấu hình hoặc trạng thái hoạt động của Embedding Provider (ví dụ LM Studio).`,
+            },
+          ],
+        }
+      }
 
       // Also register in Dashboard API if available. Errors are logged
       // so missing dashboard rows can be diagnosed; vector data above is
@@ -198,7 +210,20 @@ export function registerKnowledgeTools(server: McpServer, env: McpEnv) {
       if (userId) filter.user_id = userId
       if (projectId) filter.project_id = projectId
 
-      const results = await svc.searchKnowledge(query, limit, Object.keys(filter).length > 0 ? filter : undefined)
+      let results: any[]
+      try {
+        results = await svc.searchKnowledge(query, limit, Object.keys(filter).length > 0 ? filter : undefined)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `❌ Lỗi tìm kiếm kho tri thức (Embedding/Qdrant): ${msg}\n\nVui lòng kiểm tra lại cấu hình hoặc trạng thái hoạt động của Embedding Provider (ví dụ LM Studio).`,
+            },
+          ],
+        }
+      }
 
       if (results.length === 0) {
         return {

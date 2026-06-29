@@ -201,6 +201,7 @@ class HonoSSEServerTransport implements Transport {
   private _sessionId: string
   private _controller?: ReadableStreamDefaultController
   private _encoder = new TextEncoder()
+  private _pingInterval?: NodeJS.Timeout
 
   onclose?: () => void
   onerror?: (error: Error) => void
@@ -230,6 +231,17 @@ class HonoSSEServerTransport implements Transport {
 
         const data = `event: endpoint\ndata: ${relativeUrlWithSession}\n\n`
         controller.enqueue(this._encoder.encode(data))
+
+        // Start ping interval to keep connection alive (prevent reverse proxy timeouts)
+        this._pingInterval = setInterval(() => {
+          try {
+            if (this._controller) {
+              this._controller.enqueue(this._encoder.encode(':\n\n'))
+            }
+          } catch (err) {
+            this.close()
+          }
+        }, 15000)
       },
       cancel: () => {
         this.close()
@@ -264,6 +276,10 @@ class HonoSSEServerTransport implements Transport {
   }
 
   async close(): Promise<void> {
+    if (this._pingInterval) {
+      clearInterval(this._pingInterval)
+      this._pingInterval = undefined
+    }
     if (this._controller) {
       try {
         this._controller.close()
